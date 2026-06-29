@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 INIT = ROOT / "vendor" / "ARC-AGI-3-Agents" / "agents" / "__init__.py"
 
 SLIM = '''\
-"""Slimmed by scripts/slim_framework.py — only random + user agent registered."""
+"""Slimmed by scripts/slim_framework.py - only random + user agent registered."""
 from typing import Type
 from dotenv import load_dotenv
 from .agent import Agent, Playback

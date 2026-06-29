@@ -15,6 +15,11 @@ logs.log
 # Generated artefacts
 notebooks/submission.ipynb
 reference/
+*.pt
+*.pth
+*.ckpt
+arc_agi_3_public_demo_human_testing.zip
+.codegraph/
 
 # OS / editors
 .DS_Store

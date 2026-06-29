@@ -32,11 +32,25 @@ class _GameAction:
     ACTION5 = _Action(5)
     ACTION6 = _Action(6)
     ACTION7 = _Action(7)
-    RESET = _Action(8)
+    RESET = _Action(0)
 
     @staticmethod
     def from_id(value: int):
-        return _Action(value)
+        valid_actions = {
+            0: _GameAction.RESET,
+            1: _GameAction.ACTION1,
+            2: _GameAction.ACTION2,
+            3: _GameAction.ACTION3,
+            4: _GameAction.ACTION4,
+            5: _GameAction.ACTION5,
+            6: _GameAction.ACTION6,
+            7: _GameAction.ACTION7,
+        }
+        try:
+            template = valid_actions[int(value)]
+        except KeyError as exc:
+            raise ValueError(f"No GameAction with id {value}") from exc
+        return _Action(template.value)
 
 
 class _GameState:
@@ -187,6 +201,36 @@ class MyAgentUnitTests(unittest.TestCase):
         self.assertEqual(tuple(tensor.shape), (26, 64, 64))
         self.assertTrue(np.allclose(tensor[21:].cpu().numpy(), 0.0))
 
+    def test_encode_frame_tensor_reuses_cached_full_tensor_for_same_frame(self):
+        import torch
+
+        agent = self.make_agent()
+        frame = np.full((64, 64), 3, dtype=np.uint8)
+
+        first = agent._encode_frame_tensor(frame)
+        with mock.patch.object(agent, "_encode_static_frame_cpu", side_effect=AssertionError("should reuse cached static encoding")):
+            second = agent._encode_frame_tensor(frame.copy())
+
+        self.assertIsNotNone(agent._tensor_cached_full)
+        self.assertEqual(tuple(second.shape), (26, 64, 64))
+        self.assertTrue(torch.equal(first, second))
+
+    def test_encode_frame_tensor_reuses_zero_tail_cache_across_new_frames(self):
+        agent = self.make_agent()
+        frame_a = np.full((64, 64), 3, dtype=np.uint8)
+        frame_b = np.full((64, 64), 4, dtype=np.uint8)
+
+        agent._encode_frame_tensor(frame_a)
+        self.assertEqual(len(agent._tensor_zero_tail_cache), 1)
+        first_tail = next(iter(agent._tensor_zero_tail_cache.values()))
+
+        agent._encode_frame_tensor(frame_b)
+        self.assertEqual(len(agent._tensor_zero_tail_cache), 1)
+        second_tail = next(iter(agent._tensor_zero_tail_cache.values()))
+
+        self.assertIs(first_tail, second_tail)
+        self.assertEqual(tuple(second_tail.shape), (5, 64, 64))
+
     def test_try_bfs_solve_uses_frame_object_for_tensor_guidance(self):
         agent = self.make_agent()
         frame = _make_frame(1)
@@ -304,7 +348,7 @@ class MyAgentUnitTests(unittest.TestCase):
 
         result = agent.choose_action([], frame)
 
-        self.assertEqual(result.value, 8)
+        self.assertEqual(result.value, _GameAction.RESET.value)
         self.assertEqual(result.reasoning, "reset")
         self.assertIsNone(agent.pt)
         self.assertIsNone(agent.pai)
@@ -333,6 +377,7 @@ class MyAgentUnitTests(unittest.TestCase):
         self.assertIsNotNone(agent.pt)
         self.assertEqual(agent.ph, agent._fast_frame_hash(frame.frame[-1]))
         self.assertTrue(np.array_equal(agent.pr, frame.frame[-1]))
+        self.assertIs(agent.pr, agent.fhist[0])
         self.assertEqual(result.reasoning, "mutated")
 
     def test_bfs_solution_execution_refreshes_semantic_target_coord(self):
@@ -379,6 +424,22 @@ class MyAgentUnitTests(unittest.TestCase):
         agent.pr = frame.copy()
 
         agent._refresh_semantic_target_coord(frame, fallback_coord=(19, 12))
+
+        self.assertIsNone(agent._semantic_target_coord)
+
+    def test_refresh_semantic_target_coord_discards_recent_blocked_click_fallback_when_current_block_differs(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        agent._semantic_detector = lambda grid: {"components_per_value": {}}
+        agent._semantic_target_coord = (30, 40)
+        agent._remember_blocked_click_coord((19, 12))
+
+        agent._refresh_semantic_target_coord(
+            frame,
+            fallback_coord=(19, 12),
+            blocked_click_coord=(0, 0),
+            frame_hash=agent._fast_frame_hash(frame),
+        )
 
         self.assertIsNone(agent._semantic_target_coord)
 
@@ -533,7 +594,7 @@ class MyAgentUnitTests(unittest.TestCase):
 
         result = agent.choose_action([], frame)
 
-        self.assertEqual(result.value, 8)
+        self.assertEqual(result.value, _GameAction.RESET.value)
         self.assertEqual(result.reasoning, "no-action")
         self.assertEqual(agent.action_counter, 1)
         self.assertEqual(agent.la, 0)
@@ -568,7 +629,7 @@ class MyAgentUnitTests(unittest.TestCase):
         reset_frame = _make_frame(0, actions=[])
         reset_agent._lvl = lambda _: (_ for _ in ()).throw(RuntimeError("boom"))
         reset_result = reset_agent.choose_action([], reset_frame)
-        self.assertEqual(reset_result.value, 8)
+        self.assertEqual(reset_result.value, _GameAction.RESET.value)
         self.assertIn("err:boom", reset_result.reasoning)
         self.assertIsNone(reset_agent.pt)
         self.assertIsNone(reset_agent.pai)
@@ -583,7 +644,7 @@ class MyAgentUnitTests(unittest.TestCase):
 
         result = agent.choose_action([], frame)
 
-        self.assertEqual(result.value, 8)
+        self.assertEqual(result.value, _GameAction.RESET.value)
         self.assertIsNone(agent._semantic_target_coord)
 
     def test_error_fallback_click_prefers_semantic_target(self):
@@ -677,6 +738,19 @@ class MyAgentUnitTests(unittest.TestCase):
         self.assertEqual(result.data, {"x": 28, "y": 20})
         self.assertEqual(result.reasoning, "err:boom")
 
+    def test_error_fallback_commits_to_direct_clickable_target_before_direction(self):
+        agent = self.make_agent()
+        frame = _make_frame(0, actions=[_GameAction.ACTION4, _GameAction.ACTION6], levels=0)
+        frame.frame[-1][20:22, 20:22] = 4
+        frame.frame[-1][20:22, 22:24] = 14
+        agent._lvl = lambda _: (_ for _ in ()).throw(RuntimeError("boom"))
+
+        result = agent.choose_action([], frame)
+
+        self.assertEqual(result.value, 6)
+        self.assertEqual(result.data, {"x": 22, "y": 20})
+        self.assertEqual(result.reasoning, "err:boom")
+
     def test_error_fallback_avoids_known_blocked_direction_when_alternative_exists(self):
         agent = self.make_agent()
         frame = _make_frame(0, actions=[_GameAction.ACTION2, _GameAction.ACTION4], levels=0)
@@ -701,6 +775,55 @@ class MyAgentUnitTests(unittest.TestCase):
         self.assertEqual(result.value, 5)
         self.assertEqual(result.reasoning, "err:boom")
 
+    def test_error_fallback_retries_blocked_direction_after_stale_wait(self):
+        agent = self.make_agent()
+        frame = _make_frame(0, actions=[_GameAction.ACTION2, _GameAction.ACTION5], levels=0)
+        agent._unproductive = 7
+        agent.pt = object()
+        agent.pai = 4
+        agent.pr = frame.frame[-1].copy()
+        agent.ph = agent._fast_frame_hash(agent.pr)
+        agent._remember_blocked_direction_index(1)
+        agent._lvl = lambda _: (_ for _ in ()).throw(RuntimeError("boom"))
+
+        result = agent.choose_action([], frame)
+
+        self.assertEqual(result.value, 2)
+        self.assertEqual(result.reasoning, "err:boom")
+
+    def test_error_fallback_prefers_undo_when_frontier_is_exhausted(self):
+        agent = self.make_agent()
+        frame = _make_frame(0, actions=[_GameAction.ACTION2, _GameAction.ACTION4, _GameAction.ACTION7], levels=0)
+        agent._remember_blocked_direction_index(1)
+        agent._remember_blocked_direction_index(3)
+        agent._ckpt_hash = 99
+        agent._semantic_detector = lambda grid: {"components_per_value": {}}
+        agent._lvl = lambda _: (_ for _ in ()).throw(RuntimeError("boom"))
+
+        result = agent.choose_action([], frame)
+
+        self.assertEqual(result.value, 7)
+        self.assertEqual(result.reasoning, "err:boom")
+
+    def test_error_fallback_prefers_undo_after_stale_wait_recovery(self):
+        agent = self.make_agent()
+        frame = _make_frame(0, actions=[_GameAction.ACTION2, _GameAction.ACTION4, _GameAction.ACTION5, _GameAction.ACTION7], levels=0)
+        agent._unproductive = 7
+        agent.pt = object()
+        agent.pai = 4
+        agent.pr = frame.frame[-1].copy()
+        agent.ph = agent._fast_frame_hash(agent.pr)
+        agent._remember_blocked_direction_index(1)
+        agent._remember_blocked_direction_index(3)
+        agent._ckpt_hash = 99
+        agent._semantic_detector = lambda grid: {"components_per_value": {}}
+        agent._lvl = lambda _: (_ for _ in ()).throw(RuntimeError("boom"))
+
+        result = agent.choose_action([], frame)
+
+        self.assertEqual(result.value, 7)
+        self.assertEqual(result.reasoning, "err:boom")
+
     def test_repeat_action_shortcut_reuses_last_direction(self):
         agent = self.make_agent()
         current = _make_frame(2, actions=[_GameAction.ACTION1, _GameAction.ACTION2], levels=0)
@@ -719,6 +842,64 @@ class MyAgentUnitTests(unittest.TestCase):
         self.assertEqual(agent.la, 1)
         self.assertEqual(len(agent.fhist), 1)
         self.assertTrue(np.array_equal(agent.pr, current.frame[-1]))
+        self.assertIs(agent.pr, agent.fhist[0])
+
+    def test_repeat_action_shortcut_skips_recent_frame_revisit_loop(self):
+        agent = self.make_agent()
+        raw = np.full((64, 64), 2, dtype=np.uint8)
+        prev = np.zeros((64, 64), dtype=np.uint8)
+        agent.pai = 1
+        agent.pr = prev.copy()
+        agent.ph = agent._fast_frame_hash(prev)
+        agent.fhist.extend([raw.copy(), prev.copy()])
+
+        with mock.patch.object(self.mod.random, "random", return_value=0.0):
+            result = agent._try_repeat_direction_action(
+                raw,
+                [_GameAction.ACTION1, _GameAction.ACTION2],
+                [1, 2],
+                object(),
+                agent._fast_frame_hash(raw),
+            )
+
+        self.assertIsNone(result)
+
+    def test_repeat_action_shortcut_skips_when_recent_direction_increased_semantic_distance(self):
+        agent = self.make_agent()
+        prev = np.zeros((64, 64), dtype=np.uint8)
+        curr = np.zeros((64, 64), dtype=np.uint8)
+        prev[20, 20] = 4
+        curr[20, 21] = 4
+        prev[20, 18] = 6
+        curr[20, 18] = 6
+
+        def fake_detector(grid):
+            grid = np.asarray(grid, dtype=np.uint8)
+            components = {}
+            for color in (4, 6):
+                ys, xs = np.where(grid == color)
+                if ys.size:
+                    components[str(color)] = [{
+                        "center": (float(ys.mean()), float(xs.mean())),
+                        "cell_count": int(ys.size),
+                    }]
+            return {"components_per_value": components}
+
+        agent._semantic_detector = fake_detector
+        agent.pai = 3
+        agent.pr = prev
+        agent.ph = agent._fast_frame_hash(prev)
+
+        with mock.patch.object(self.mod.random, "random", return_value=0.0):
+            result = agent._try_repeat_direction_action(
+                curr,
+                [_GameAction.ACTION3, _GameAction.ACTION4],
+                [3, 4],
+                object(),
+                agent._fast_frame_hash(curr),
+            )
+
+        self.assertIsNone(result)
 
     def test_repeat_action_shortcut_refreshes_semantic_target_coord(self):
         agent = self.make_agent()
@@ -745,6 +926,13 @@ class MyAgentUnitTests(unittest.TestCase):
 
         self.assertEqual(result.value, 2)
         self.assertEqual(agent._semantic_target_coord, (22, 23))
+
+    def test_preferred_click_coord_drops_stale_target_after_unproductive_streak(self):
+        agent = self.make_agent()
+        agent._semantic_target_coord = (18, 46)
+        agent._unproductive = 8
+
+        self.assertIsNone(agent._preferred_click_coord())
 
     def test_repeat_action_shortcut_yields_to_new_semantic_direction(self):
         agent = self.make_agent()
@@ -929,6 +1117,46 @@ class MyAgentUnitTests(unittest.TestCase):
         self.assertEqual(result.value, 6)
         self.assertEqual(result.data, {"x": 20, "y": 10})
 
+    def test_repeat_action_shortcut_yields_to_direct_click_choice_even_when_click_matches_preferred(self):
+        agent = self.make_agent()
+        current = _make_frame(2, actions=[_GameAction.ACTION2, _GameAction.ACTION6], levels=0)
+        agent.cl = 0
+        agent.pt = object()
+        agent.pai = 1
+        agent.pr = np.zeros((64, 64), dtype=np.uint8)
+        agent.ph = 0
+        agent._wd = True
+        agent._semantic_target_coord = (19, 35)
+        agent._semantic_direct_click_choice = lambda *args, **kwargs: (5, (19, 35))
+        agent._semantic_direction_action = lambda *args, **kwargs: None
+        agent._semantic_click_targets_compat = lambda *args, **kwargs: [(19, 35)]
+
+        with mock.patch.object(self.mod.random, "random", return_value=0.0):
+            result = agent.choose_action([], current)
+
+        self.assertEqual(result.value, 6)
+        self.assertEqual(result.data, {"x": 35, "y": 19})
+        self.assertEqual(result.reasoning, "cnn:c(35,19)")
+
+    def test_try_repeat_direction_action_returns_none_when_direct_click_choice_exists(self):
+        agent = self.make_agent()
+        raw = np.zeros((64, 64), dtype=np.uint8)
+        agent.pai = 1
+        agent.pr = np.full((64, 64), 2, dtype=np.uint8)
+        agent.ph = agent._fast_frame_hash(agent.pr)
+        agent._semantic_direct_click_choice = lambda *args, **kwargs: (5, (19, 35))
+
+        with mock.patch.object(self.mod.random, "random", return_value=0.0):
+            result = agent._try_repeat_direction_action(
+                raw,
+                [_GameAction.ACTION2, _GameAction.ACTION6],
+                [2, 6],
+                object(),
+                agent._fast_frame_hash(raw),
+            )
+
+        self.assertIsNone(result)
+
     def test_no_click_path_uses_forward_actions_head(self):
         import torch
 
@@ -989,6 +1217,27 @@ class MyAgentUnitTests(unittest.TestCase):
         self.assertEqual(agent._unproductive, 0)
         self.assertIsNone(agent._semantic_target_coord)
         self.assertTrue(np.array_equal(agent.pr, frame.frame[-1]))
+
+    def test_undo_shortcut_fires_early_on_recent_frame_revisit_loop(self):
+        agent = self.make_agent()
+        frame = _make_frame(4, actions=[_GameAction.ACTION1, _GameAction.ACTION7], levels=0)
+
+        agent.cl = 0
+        agent._wd = True
+        agent._unproductive = 2
+        agent._ckpt_hash = 99
+        agent.pt = object()
+        agent.pai = 0
+        previous = np.zeros((64, 64), dtype=np.uint8)
+        agent.pr = previous.copy()
+        agent.ph = agent._fast_frame_hash(previous)
+        agent.fhist.extend([frame.frame[-1].copy(), previous.copy()])
+
+        result = agent.choose_action([], frame)
+
+        self.assertEqual(result.value, 7)
+        self.assertEqual(result.reasoning, "undo")
+        self.assertEqual(agent._unproductive, 0)
 
     def test_undo_transition_is_not_written_into_replay_or_aem(self):
         agent = self.make_agent()
@@ -1142,6 +1391,46 @@ class MyAgentUnitTests(unittest.TestCase):
         self.assertEqual(mask[5].item(), 0.0)
         self.assertTrue(torch.isneginf(mask[0]))
 
+    def test_legal_action_mask_reuses_cached_tensor_for_same_availability(self):
+        import torch
+
+        agent = self.make_agent()
+        logits = torch.zeros(4101, dtype=torch.float32, device=agent.device)
+        avail = [_GameAction.ACTION6, _GameAction.ACTION3]
+
+        first = agent._legal_action_mask(logits, avail)
+        second = agent._legal_action_mask(logits, avail)
+
+        self.assertIs(first, second)
+
+    def test_legal_modeled_action_count_matches_directional_and_click_legal_space(self):
+        agent = self.make_agent()
+
+        self.assertEqual(agent._legal_modeled_action_count(5, [2, 4]), 2)
+        self.assertEqual(agent._legal_modeled_action_count(4101, [2, 4, 6]), 4098)
+        self.assertEqual(agent._legal_modeled_action_count(4101, []), 4101)
+
+    def test_legal_direction_ids_reuse_cached_set_for_same_availability(self):
+        agent = self.make_agent()
+
+        first = agent._legal_direction_ids([2, 4, 6])
+        second = agent._legal_direction_ids([2, 4, 6])
+
+        self.assertIs(first, second)
+        self.assertEqual(first, frozenset({2, 4}))
+
+    def test_availability_summary_reuses_cached_flags_for_same_availability(self):
+        agent = self.make_agent()
+
+        first = agent._availability_summary([2, 4, 6, 7])
+        second = agent._availability_summary([2, 4, 6, 7])
+
+        self.assertIs(first, second)
+        self.assertTrue(first["has_click"])
+        self.assertTrue(first["has_undo"])
+        self.assertTrue(first["has_modeled"])
+        self.assertEqual(first["legal_dirs"], frozenset({2, 4}))
+
     def test_cnn_rescoring_honors_directions_even_when_click_appears_first(self):
         agent = self.make_agent()
         frame = _make_frame(0, actions=[_GameAction.ACTION6, _GameAction.ACTION3], levels=0)
@@ -1228,6 +1517,183 @@ class MyAgentUnitTests(unittest.TestCase):
 
         self.assertEqual((round(choice["target_y"]), round(choice["target_x"])), (21, 24))
 
+    def test_heuristic_commits_to_direct_clickable_target_before_walking(self):
+        agent = self.make_agent()
+        frame = _make_frame(0, actions=[_GameAction.ACTION4, _GameAction.ACTION6], levels=0)
+
+        def fake_detector(grid):
+            return {
+                "components_per_value": {
+                    "4": [{"center": (20.0, 20.0), "cell_count": 4}],
+                    "14": [{"center": (20.0, 22.0), "cell_count": 4}],
+                }
+            }
+
+        agent._semantic_detector = fake_detector
+
+        result = agent.choose_action([], frame)
+
+        self.assertEqual(result.value, 6)
+        self.assertEqual(result.data, {"x": 22, "y": 20})
+        self.assertEqual(result.reasoning, "cnn:c(22,20)")
+
+    def test_heuristic_commits_to_click_target_without_player_component(self):
+        agent = self.make_agent()
+        frame = _make_frame(0, actions=[_GameAction.ACTION4, _GameAction.ACTION6], levels=0)
+
+        def fake_detector(grid):
+            return {
+                "components_per_value": {
+                    "14": [{"center": (20.0, 22.0), "cell_count": 4}],
+                }
+            }
+
+        agent._semantic_detector = fake_detector
+
+        result = agent.choose_action([], frame)
+
+        self.assertEqual(result.value, 6)
+        self.assertEqual(result.data, {"x": 22, "y": 20})
+        self.assertEqual(result.reasoning, "cnn:c(22,20)")
+
+    def test_policy_commits_to_direct_clickable_target_before_direction_logit(self):
+        agent = self.make_agent()
+        frame = _make_frame(0, actions=[_GameAction.ACTION4, _GameAction.ACTION6], levels=0)
+        logits = np.full(4101, -10.0, dtype=np.float32)
+        logits[3] = 9.0
+
+        def fake_detector(grid):
+            return {
+                "components_per_value": {
+                    "4": [{"center": (20.0, 20.0), "cell_count": 4}],
+                    "14": [{"center": (20.0, 22.0), "cell_count": 4}],
+                }
+            }
+
+        agent._semantic_detector = fake_detector
+        agent.cl = 0
+        agent._wd = True
+        agent._eps = 0.0
+        agent.net = _FixedLogitNet(logits, agent.device)
+        agent._bfs = types.SimpleNamespace(
+            _action_key=lambda act_id, data: (act_id, None if not data else (data.get("x"), data.get("y"))),
+            _action_priority={},
+        )
+
+        result = agent.choose_action([], frame)
+
+        self.assertEqual(result.value, 6)
+        self.assertEqual(result.data, {"x": 22, "y": 20})
+        self.assertEqual(result.reasoning, "cnn:c(22,20)")
+
+    def test_policy_commits_to_click_target_without_player_component(self):
+        agent = self.make_agent()
+        frame = _make_frame(0, actions=[_GameAction.ACTION4, _GameAction.ACTION6], levels=0)
+        logits = np.full(4101, -10.0, dtype=np.float32)
+        logits[3] = 9.0
+
+        def fake_detector(grid):
+            return {
+                "components_per_value": {
+                    "14": [{"center": (20.0, 22.0), "cell_count": 4}],
+                }
+            }
+
+        agent._semantic_detector = fake_detector
+        agent.cl = 0
+        agent._wd = True
+        agent._eps = 0.0
+        agent.net = _FixedLogitNet(logits, agent.device)
+        agent._bfs = types.SimpleNamespace(
+            _action_key=lambda act_id, data: (act_id, None if not data else (data.get("x"), data.get("y"))),
+            _action_priority={},
+        )
+
+        result = agent.choose_action([], frame)
+
+        self.assertEqual(result.value, 6)
+        self.assertEqual(result.data, {"x": 22, "y": 20})
+        self.assertEqual(result.reasoning, "cnn:c(22,20)")
+
+    def test_heuristic_commits_to_preferred_click_target_without_player_component(self):
+        agent = self.make_agent()
+        frame = _make_frame(0, actions=[_GameAction.ACTION4, _GameAction.ACTION6], levels=0)
+        agent._semantic_target_coord = (32, 42)
+
+        def fake_detector(grid):
+            return {
+                "components_per_value": {
+                    "14": [
+                        {"center": (0.0, 0.0), "cell_count": 4},
+                        {"center": (32.0, 42.0), "cell_count": 4},
+                    ],
+                }
+            }
+
+        agent._semantic_detector = fake_detector
+
+        result = agent.choose_action([], frame)
+
+        self.assertEqual(result.value, 6)
+        self.assertEqual(result.data, {"x": 42, "y": 32})
+        self.assertEqual(result.reasoning, "cnn:c(42,32)")
+
+    def test_direct_click_choice_no_player_drops_preferred_target_after_unproductive_streak(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        agent._semantic_target_coord = (32, 42)
+        agent._unproductive = 8
+        agent._semantic_target_choice = lambda *args, **kwargs: None
+        agent._semantic_components = lambda *args, **kwargs: {"14": [{"center": (0.0, 0.0), "cell_count": 4}]}
+        agent._semantic_click_targets_compat = lambda *args, **kwargs: [(0, 0)]
+        agent._heuristic_click_fallback_targets = lambda *args, **kwargs: []
+
+        choice = agent._semantic_direct_click_choice(frame, avail_ids=[6], frame_hash=agent._fast_frame_hash(frame))
+
+        self.assertEqual(choice, (5, (0, 0)))
+
+    def test_heuristic_direct_click_without_player_skips_recent_blocked_preferred_target(self):
+        agent = self.make_agent()
+        frame = _make_frame(0, actions=[_GameAction.ACTION4, _GameAction.ACTION6], levels=0)
+        agent.cl = 0
+        agent._semantic_target_coord = (32, 42)
+        agent._remember_blocked_click_coord((32, 42))
+
+        def fake_detector(grid):
+            return {
+                "components_per_value": {
+                    "14": [
+                        {"center": (0.0, 0.0), "cell_count": 4},
+                        {"center": (32.0, 42.0), "cell_count": 4},
+                    ],
+                }
+            }
+
+        agent._semantic_detector = fake_detector
+
+        result = agent.choose_action([], frame)
+
+        self.assertEqual(result.value, 6)
+        self.assertEqual(result.data, {"x": 0, "y": 0})
+        self.assertEqual(result.reasoning, "cnn:c(0,0)")
+
+    def test_semantic_direct_click_choice_skips_recent_blocked_preferred_target(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        agent._semantic_target_coord = (20, 22)
+        agent._remember_blocked_click_coord((20, 22))
+        agent._semantic_target_choice = lambda *args, **kwargs: {
+            "priority": 1,
+            "distance": 2.0,
+            "target_y": 20.0,
+            "target_x": 23.0,
+        }
+        agent._semantic_click_targets_compat = lambda *args, **kwargs: [(20, 24)]
+
+        choice = agent._semantic_direct_click_choice(frame, avail_ids=[6], frame_hash=agent._fast_frame_hash(frame))
+
+        self.assertEqual(choice, (5, (20, 24)))
+
     def test_semantic_target_choice_skips_nearby_blocked_click_jitter(self):
         agent = self.make_agent()
         frame = np.zeros((64, 64), dtype=np.uint8)
@@ -1248,6 +1714,32 @@ class MyAgentUnitTests(unittest.TestCase):
         agent.pr = frame.copy()
 
         choice = agent._semantic_target_choice(frame)
+
+        self.assertEqual((round(choice["target_y"]), round(choice["target_x"])), (22, 40))
+
+    def test_semantic_target_choice_skips_recent_blocked_history_when_current_block_differs(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+
+        def fake_detector(grid):
+            return {
+                "components_per_value": {
+                    "4": [{"center": (20.0, 20.0), "cell_count": 4}],
+                    "14": [
+                        {"center": (19.0, 12.0), "cell_count": 4},
+                        {"center": (22.0, 40.0), "cell_count": 4},
+                    ],
+                }
+            }
+
+        agent._semantic_detector = fake_detector
+        agent._remember_blocked_click_coord((19, 12))
+
+        choice = agent._semantic_target_choice(
+            frame,
+            blocked_click_coord=(0, 0),
+            frame_hash=agent._fast_frame_hash(frame),
+        )
 
         self.assertEqual((round(choice["target_y"]), round(choice["target_x"])), (22, 40))
 
@@ -1321,6 +1813,37 @@ class MyAgentUnitTests(unittest.TestCase):
         self.assertEqual(choice["momentum_bonus"], 0.12)
         self.assertEqual(choice["counter_momentum_penalty"], 0.0)
 
+    def test_semantic_target_choice_drops_momentum_bias_after_recent_direction_worsens_distance(self):
+        agent = self.make_agent()
+        prev = np.zeros((64, 64), dtype=np.uint8)
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        prev[20, 20] = 4
+        frame[20, 21] = 4
+
+        def fake_detector(grid):
+            grid = np.asarray(grid, dtype=np.uint8)
+            player_x = 20.0 if grid[20, 20] == 4 else 21.0
+            return {
+                "components_per_value": {
+                    "4": [{"center": (20.0, player_x), "cell_count": 1}],
+                    "6": [
+                        {"center": (20.0, 18.0), "cell_count": 4},
+                        {"center": (20.0, 25.0), "cell_count": 4},
+                    ],
+                }
+            }
+
+        agent._semantic_detector = fake_detector
+        agent.pai = 3
+        agent.pr = prev
+        agent.ph = agent._fast_frame_hash(prev)
+
+        choice = agent._semantic_target_choice(frame)
+
+        self.assertEqual((round(choice["target_y"]), round(choice["target_x"])), (20, 18))
+        self.assertEqual(choice["momentum_bonus"], 0.0)
+        self.assertEqual(choice["counter_momentum_penalty"], 0.0)
+
     def test_semantic_target_choice_breaks_equal_scores_toward_continuity(self):
         agent = self.make_agent()
         frame = np.zeros((64, 64), dtype=np.uint8)
@@ -1329,10 +1852,7 @@ class MyAgentUnitTests(unittest.TestCase):
             return {
                 "components_per_value": {
                     "4": [{"center": (20.0, 20.0), "cell_count": 4}],
-                    "14": [
-                        {"center": (25.0, 20.0), "cell_count": 4},
-                        {"center": (20.0, 28.0), "cell_count": 4},
-                    ],
+                    "14": [{"center": (20.0, 28.0), "cell_count": 4}],
                 }
             }
 
@@ -1343,6 +1863,52 @@ class MyAgentUnitTests(unittest.TestCase):
 
         self.assertEqual((round(choice["target_y"]), round(choice["target_x"])), (20, 28))
         self.assertGreater(choice["continuity_bonus"], 0.0)
+
+    def test_semantic_target_choice_drops_continuity_after_unproductive_streak(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+
+        def fake_detector(grid):
+            return {
+                "components_per_value": {
+                    "4": [{"center": (20.0, 20.0), "cell_count": 4}],
+                    "14": [
+                        {"center": (20.0, 28.0), "cell_count": 4},
+                        {"center": (20.0, 30.0), "cell_count": 4},
+                    ],
+                }
+            }
+
+        agent._semantic_detector = fake_detector
+        agent._semantic_target_coord = (20, 30)
+        agent._unproductive = 8
+
+        choice = agent._semantic_target_choice(frame)
+
+        self.assertEqual((round(choice["target_y"]), round(choice["target_x"])), (20, 28))
+        self.assertEqual(choice["continuity_bonus"], 0.0)
+
+    def test_semantic_target_choice_softens_continuity_before_full_cutoff(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+
+        def fake_detector(grid):
+            return {
+                "components_per_value": {
+                    "4": [{"center": (20.0, 20.0), "cell_count": 4}],
+                    "14": [{"center": (20.0, 28.0), "cell_count": 4}],
+                }
+            }
+
+        agent._semantic_detector = fake_detector
+        agent._semantic_target_coord = (20, 29)
+
+        fresh_choice = agent._semantic_target_choice(frame)
+        agent._unproductive = 6
+        stale_choice = agent._semantic_target_choice(frame)
+
+        self.assertGreater(fresh_choice["continuity_bonus"], stale_choice["continuity_bonus"])
+        self.assertGreater(stale_choice["continuity_bonus"], 0.0)
 
     def test_semantic_target_choice_prefers_larger_equally_scored_target(self):
         agent = self.make_agent()
@@ -1364,6 +1930,16 @@ class MyAgentUnitTests(unittest.TestCase):
         choice = agent._semantic_target_choice(frame)
 
         self.assertEqual(choice["area"], 9)
+
+    def test_semantic_click_bonus_scale_uses_supplied_target_choice(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        target_choice = {"distance": 8.0}
+
+        with mock.patch.object(agent, "_semantic_target_choice", side_effect=AssertionError("should use supplied target choice")):
+            scale = agent._semantic_click_bonus_scale(frame, target_choice=target_choice)
+
+        self.assertAlmostEqual(scale, 0.5, places=5)
 
     def test_reward_boosts_semantic_progress_toward_target(self):
         agent = self.make_agent()
@@ -1406,6 +1982,60 @@ class MyAgentUnitTests(unittest.TestCase):
         self.assertLess(reward, 0.3)
         self.assertEqual(agent._state_visit_counts["same"], 1)
 
+    def test_reward_penalizes_recent_two_step_frame_revisit(self):
+        agent = self.make_agent()
+        prev = np.zeros((64, 64), dtype=np.uint8)
+        older = np.full((64, 64), 2, dtype=np.uint8)
+        curr = older.copy()
+        agent.fhist.extend([older.copy(), prev.copy()])
+        prev_h = agent._fast_frame_hash(prev)
+        curr_h = agent._fast_frame_hash(curr)
+
+        revisit = agent._reward(prev, curr, prev_h, curr_h, changed=True, curr_objs=[], move_bonus=0.0, moved=0)
+
+        baseline_agent = self.make_agent()
+        baseline = baseline_agent._reward(prev, curr, prev_h, curr_h, changed=True, curr_objs=[], move_bonus=0.0, moved=0)
+
+        self.assertLess(revisit, baseline)
+
+    def test_recent_frame_revisit_penalty_skips_immediate_previous_frame_hash(self):
+        agent = self.make_agent()
+        prev = np.zeros((64, 64), dtype=np.uint8)
+        curr_h = agent._fast_frame_hash(prev)
+        agent.fhist.append(prev.copy())
+
+        penalty = agent._recent_frame_revisit_penalty(curr_h, curr_h)
+
+        self.assertEqual(penalty, 0.0)
+
+    def test_wait_recovery_bonus_uses_supplied_availability_summary(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        agent._unproductive = 6
+        agent._remember_blocked_direction_index(0)
+        agent._remember_blocked_direction_index(1)
+        agent._remember_blocked_direction_index(2)
+        agent._remember_blocked_direction_index(3)
+        agent.pai = 0
+        agent.pr = frame.copy()
+        agent.ph = agent._fast_frame_hash(agent.pr)
+        avail_summary = {
+            "has_click": False,
+            "has_undo": False,
+            "has_modeled": True,
+            "legal_dirs": frozenset({1, 2, 3, 4}),
+        }
+
+        with mock.patch.object(agent, "_availability_summary", side_effect=AssertionError("should use supplied availability summary")):
+            bonus = agent._wait_recovery_bonus(
+                frame,
+                [1, 2, 3, 4, 5],
+                frame_hash=agent._fast_frame_hash(frame),
+                avail_summary=avail_summary,
+            )
+
+        self.assertEqual(bonus, 0.3)
+
     def test_choose_action_reward_uses_previous_hash_for_same_state(self):
         agent = self.make_agent()
         frame = _make_frame(0, actions=[_GameAction.ACTION1, _GameAction.ACTION2], levels=0)
@@ -1431,6 +2061,29 @@ class MyAgentUnitTests(unittest.TestCase):
 
         self.assertEqual(captured["prev_h"], agent.ph)
         self.assertEqual(captured["curr_h"], agent._fast_frame_hash(frame.frame[-1]))
+
+    def test_choose_action_progress_decays_blocked_histories_instead_of_clearing_them(self):
+        agent = self.make_agent()
+        previous = _make_frame(0, actions=[_GameAction.ACTION1], levels=0)
+        current = _make_frame(1, actions=[_GameAction.ACTION1], levels=0)
+        agent.cl = 0
+        agent.pt = object()
+        agent.pai = 0
+        agent.pr = previous.frame[-1].copy()
+        agent.ph = agent._fast_frame_hash(agent.pr)
+        agent._remember_blocked_click_coord((10, 10))
+        agent._remember_blocked_click_coord((20, 20))
+        agent._remember_blocked_click_coord((30, 30))
+        agent._remember_blocked_direction_index(0)
+        agent._remember_blocked_direction_index(1)
+        agent._remember_blocked_direction_index(2)
+        agent._try_repeat_direction_action = lambda *args, **kwargs: None
+
+        result = agent.choose_action([], current)
+
+        self.assertEqual(result.value, 1)
+        self.assertEqual(list(agent._blocked_click_history), [(20, 20), (30, 30)])
+        self.assertEqual(list(agent._blocked_direction_history), [1, 2])
 
     def test_dedup_hit_still_updates_novelty_bookkeeping(self):
         agent = self.make_agent()
@@ -1483,6 +2136,21 @@ class MyAgentUnitTests(unittest.TestCase):
         mask_2d = mask.view(64, 64)
         self.assertTrue(np.allclose(mask_2d[:, :31].cpu().numpy(), 0.05))
         self.assertTrue(np.allclose(mask_2d[:, 31:].cpu().numpy(), 1.0))
+
+    def test_detect_template_masks_upper_half_after_sparse_separator_row(self):
+        agent = self.make_agent()
+        frame = np.full((64, 64), 8, dtype=np.uint8)
+        frame[29, :] = 0
+        frame[29, 8] = 8
+        frame[29, 55] = 8
+        agent._bg = 0
+
+        mask = agent._detect_template(frame)
+
+        self.assertEqual(mask.shape[0], 4096)
+        mask_2d = mask.view(64, 64)
+        self.assertTrue(np.allclose(mask_2d[:30, :].cpu().numpy(), 0.05))
+        self.assertTrue(np.allclose(mask_2d[30:, :].cpu().numpy(), 1.0))
 
     def test_heuristic_prefers_first_available_direction_in_opening(self):
         agent = self.make_agent()
@@ -1584,6 +2252,105 @@ class MyAgentUnitTests(unittest.TestCase):
 
         self.assertEqual(targets[0], (18, 34))
         self.assertEqual(targets[1], (18, 18))
+
+    def test_semantic_click_targets_reuse_cached_components_without_player(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        calls = {"count": 0}
+
+        def fake_detector(grid):
+            calls["count"] += 1
+            return {
+                "components_per_value": {
+                    "6": [
+                        {"center": (18.0, 18.0), "cell_count": 6},
+                        {"center": (18.0, 34.0), "cell_count": 6},
+                    ],
+                }
+            }
+
+        agent._semantic_detector = fake_detector
+        agent._semantic_target_coord = (18, 34)
+
+        first = agent._semantic_click_targets(frame, limit=2)
+        second = agent._semantic_click_targets(frame, limit=2)
+
+        self.assertEqual(first, [(18, 34), (18, 18)])
+        self.assertEqual(second, [(18, 34), (18, 18)])
+        self.assertEqual(calls["count"], 1)
+
+    def test_semantic_click_targets_cache_ranked_coords_across_limit_changes(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+
+        def fake_detector(grid):
+            return {
+                "components_per_value": {
+                    "6": [
+                        {"center": (18.0, 18.0), "cell_count": 6},
+                        {"center": (18.0, 34.0), "cell_count": 6},
+                    ],
+                }
+            }
+
+        agent._semantic_detector = fake_detector
+        agent._semantic_target_coord = (18, 34)
+
+        with mock.patch.object(agent, "_click_targets_from_components", wraps=agent._click_targets_from_components) as ranked:
+            first = agent._semantic_click_targets(frame, limit=1)
+            second = agent._semantic_click_targets(frame, limit=2)
+
+        self.assertEqual(first, [(18, 34)])
+        self.assertEqual(second, [(18, 34), (18, 18)])
+        self.assertEqual(ranked.call_count, 1)
+
+    def test_semantic_click_targets_uses_supplied_frame_hash_without_rehashing(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+
+        def fake_detector(grid):
+            return {
+                "components_per_value": {
+                    "6": [
+                        {"center": (18.0, 18.0), "cell_count": 6},
+                        {"center": (18.0, 34.0), "cell_count": 6},
+                    ],
+                }
+            }
+
+        agent._semantic_detector = fake_detector
+        agent._semantic_target_coord = (18, 34)
+
+        with mock.patch.object(agent, "_fast_frame_hash", side_effect=AssertionError("should reuse supplied frame hash")):
+            targets = agent._semantic_click_targets(frame, limit=2, frame_hash=123)
+
+        self.assertEqual(targets, [(18, 34), (18, 18)])
+
+    def test_heuristic_click_fallback_targets_reuse_cached_scan(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        frame[10:12, 20:22] = 6
+        frame[30:33, 40:43] = 7
+
+        with mock.patch.object(self.mod.np, "where", wraps=self.mod.np.where) as where_mock:
+            first = agent._heuristic_click_fallback_targets(frame, frame_hash=123)
+            second = agent._heuristic_click_fallback_targets(frame, frame_hash=123)
+
+        self.assertEqual(first, second)
+        self.assertEqual(where_mock.call_count, 2)
+
+    def test_heuristic_click_fallback_targets_invalidate_cache_for_blocked_history(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        frame[10:12, 20:22] = 6
+        frame[30:33, 40:43] = 7
+
+        first = agent._heuristic_click_fallback_targets(frame, frame_hash=123)
+        agent._remember_blocked_click_coord((10, 20))
+        second = agent._heuristic_click_fallback_targets(frame, frame_hash=123)
+
+        self.assertEqual(first, [(10, 20), (31, 41)])
+        self.assertEqual(second, [(31, 41)])
 
     def test_semantic_click_targets_without_player_keep_preferred_target_across_small_jitter(self):
         agent = self.make_agent()
@@ -1687,6 +2454,28 @@ class MyAgentUnitTests(unittest.TestCase):
         self.assertEqual(comps["4"][0]["center"], (20.5, 20.5))
         self.assertEqual(comps["6"][0]["center"], (20.5, 23.5))
 
+    def test_semantic_components_reuses_detector_grid_cache_for_same_frame(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        frame[20:22, 20:22] = 4
+        frame[22:24, 40:42] = 14
+        calls = []
+
+        def fake_detector(grid):
+            calls.append(grid)
+            return {"components_per_value": {"4": [{"center": (20.5, 20.5), "cell_count": 4}]}}
+
+        agent._semantic_detector = fake_detector
+        first_hash = agent._fast_frame_hash(frame)
+        first = agent._semantic_components(frame, frame_hash=first_hash)
+        agent._semantic_components_cache_key = None
+        agent._semantic_components_cache_value = None
+        second = agent._semantic_components(frame.copy(), frame_hash=first_hash)
+
+        self.assertEqual(len(calls), 2)
+        self.assertIs(calls[0], calls[1])
+        self.assertEqual(first, second)
+
     def test_semantic_click_targets_use_raw_frame_fallback_without_detector(self):
         agent = self.make_agent()
         frame = np.zeros((64, 64), dtype=np.uint8)
@@ -1726,6 +2515,74 @@ class MyAgentUnitTests(unittest.TestCase):
         self.assertEqual(targets[0], (20, 36))
         self.assertEqual(targets[1], (18, 18))
 
+    def test_semantic_click_targets_raw_fallback_drops_preferred_target_after_unproductive_streak(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        frame[18:20, 18:20] = 6
+        frame[18:20, 46:48] = 6
+        agent._semantic_detector = None
+        agent._semantic_target_coord = (18, 46)
+        agent._unproductive = 8
+
+        targets = agent._semantic_click_targets(frame, limit=2)
+
+        self.assertEqual(targets[0], (18, 18))
+        self.assertEqual(targets[1], (18, 46))
+
+    def test_semantic_click_targets_raw_fallback_softens_preferred_target_before_full_cutoff(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        frame[10:12, 50:52] = 6
+        frame[20:22, 24:26] = 6
+        agent._semantic_detector = None
+        agent._semantic_target_coord = (10, 50)
+
+        fresh_targets = agent._semantic_click_targets(frame, limit=2)
+        agent._unproductive = 6
+        softened_targets = agent._semantic_click_targets(frame, limit=2)
+
+        self.assertEqual(fresh_targets[0], (10, 50))
+        self.assertEqual(softened_targets[0], (20, 24))
+
+    def test_semantic_click_targets_skip_recent_blocked_click_history(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        frame[18:20, 18:20] = 6
+        frame[18:20, 34:36] = 6
+        frame[18:20, 46:48] = 6
+        agent._semantic_detector = None
+        agent._remember_blocked_click_coord((18, 18))
+        agent._remember_blocked_click_coord((18, 34))
+
+        targets = agent._semantic_click_targets(frame, limit=3)
+
+        self.assertEqual(targets[0], (18, 46))
+        self.assertNotEqual(targets[0], (18, 18))
+        self.assertNotEqual(targets[0], (18, 34))
+
+    def test_semantic_click_bonus_map_uses_supplied_targets(self):
+        agent = self.make_agent()
+        click_targets = [(20, 24), (22, 40), (18, 18)]
+
+        bonus_map = agent._semantic_click_bonus_map(
+            np.zeros((64, 64), dtype=np.uint8),
+            limit=3,
+            click_scale=0.5,
+            click_targets=click_targets,
+        )
+
+        self.assertAlmostEqual(bonus_map[(20, 24)], 0.4, places=5)
+        self.assertAlmostEqual(bonus_map[(22, 40)], 0.35, places=5)
+        self.assertAlmostEqual(bonus_map[(18, 18)], 0.3, places=5)
+
+    def test_semantic_click_bonus_matches_ranked_targets_without_bonus_map(self):
+        agent = self.make_agent()
+        click_targets = [(20, 24), (22, 40), (18, 18)]
+
+        self.assertAlmostEqual(agent._semantic_click_bonus((20, 24), 0.5, click_targets), 0.4, places=5)
+        self.assertAlmostEqual(agent._semantic_click_bonus((22, 40), 0.5, click_targets), 0.35, places=5)
+        self.assertAlmostEqual(agent._semantic_click_bonus((0, 0), 0.5, click_targets), 0.0, places=5)
+
     def test_blocked_click_coord_returns_last_click_when_state_is_unchanged(self):
         agent = self.make_agent()
         frame = np.zeros((64, 64), dtype=np.uint8)
@@ -1735,6 +2592,101 @@ class MyAgentUnitTests(unittest.TestCase):
         blocked = agent._blocked_click_coord(frame)
 
         self.assertEqual(blocked, (18, 11))
+
+    def test_blocked_click_matches_recent_block_history(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        agent._remember_blocked_click_coord((18, 11))
+
+        self.assertTrue(agent._blocked_click_matches_coord(frame, (18, 12)))
+        self.assertFalse(agent._blocked_click_matches_coord(frame, (18, 15)))
+
+    def test_blocked_click_history_refreshes_recency_for_nearby_repeat(self):
+        agent = self.make_agent()
+
+        agent._remember_blocked_click_coord((10, 10))
+        agent._remember_blocked_click_coord((20, 20))
+        agent._remember_blocked_click_coord((30, 30))
+        agent._remember_blocked_click_coord((11, 10))
+        agent._remember_blocked_click_coord((40, 40))
+
+        self.assertEqual(list(agent._blocked_click_history), [(30, 30), (11, 10), (40, 40)])
+
+    def test_decay_blocked_click_history_drops_only_oldest_entry(self):
+        agent = self.make_agent()
+        agent._remember_blocked_click_coord((10, 10))
+        agent._remember_blocked_click_coord((20, 20))
+        agent._remember_blocked_click_coord((30, 30))
+
+        agent._decay_blocked_click_history()
+
+        self.assertEqual(list(agent._blocked_click_history), [(20, 20), (30, 30)])
+
+    def test_direction_matches_recent_block_history(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        agent._remember_blocked_direction_index(3)
+
+        self.assertTrue(agent._direction_matches_blocked_history(3, frame))
+        self.assertFalse(agent._direction_matches_blocked_history(1, frame))
+
+    def test_direction_matches_blocked_history_uses_supplied_blocked_direction(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+
+        with mock.patch.object(agent, "_blocked_direction_action_index", side_effect=AssertionError("should use supplied blocked direction")):
+            self.assertTrue(agent._direction_matches_blocked_history(2, frame, blocked_direction=2))
+            self.assertFalse(agent._direction_matches_blocked_history(1, frame, blocked_direction=2))
+
+    def test_blocked_direction_history_refreshes_recency_for_repeat(self):
+        agent = self.make_agent()
+
+        agent._remember_blocked_direction_index(0)
+        agent._remember_blocked_direction_index(1)
+        agent._remember_blocked_direction_index(2)
+        agent._remember_blocked_direction_index(0)
+        agent._remember_blocked_direction_index(3)
+
+        self.assertEqual(list(agent._blocked_direction_history), [2, 0, 3])
+
+    def test_decay_blocked_direction_history_drops_only_oldest_entry(self):
+        agent = self.make_agent()
+        agent._remember_blocked_direction_index(0)
+        agent._remember_blocked_direction_index(1)
+        agent._remember_blocked_direction_index(2)
+
+        agent._decay_blocked_direction_history()
+
+        self.assertEqual(list(agent._blocked_direction_history), [1, 2])
+
+    def test_previous_frame_relation_cache_reuses_single_equality_check(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        agent.pai = 5 + 18 * agent.G + 11
+        agent.pr = frame.copy()
+        agent.ph = agent._fast_frame_hash(agent.pr)
+
+        with mock.patch.object(self.mod.np, "array_equal", wraps=self.mod.np.array_equal) as array_equal:
+            self.assertEqual(agent._blocked_click_coord(frame), (18, 11))
+            self.assertEqual(agent._blocked_click_action_index(frame), 5 + 18 * agent.G + 11)
+            self.assertIsNone(agent._recent_click_action_index(frame))
+            self.assertTrue(agent._frame_matches_previous(frame))
+
+        self.assertEqual(array_equal.call_count, 1)
+
+    def test_previous_frame_relation_exposes_cached_axis_and_blocked_click_index(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        agent.pr = frame.copy()
+        agent.ph = agent._fast_frame_hash(agent.pr)
+
+        agent.pai = 1
+        moved = frame.copy()
+        moved[0, 0] = 1
+        self.assertEqual(agent._recent_direction_axis(moved), "vertical")
+
+        agent.pai = 5 + 18 * agent.G + 11
+        self.assertEqual(agent._blocked_click_action_index(frame), 5 + 18 * agent.G + 11)
 
     def test_blocked_click_action_index_returns_last_click_slot(self):
         agent = self.make_agent()
@@ -2040,6 +2992,45 @@ class MyAgentUnitTests(unittest.TestCase):
 
         self.assertEqual(action, (1, None))
 
+    def test_semantic_direction_action_avoids_recent_blocked_direction_history(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+
+        def fake_detector(grid):
+            return {
+                "components_per_value": {
+                    "4": [{"center": (20.0, 20.0), "cell_count": 4}],
+                    "14": [{"center": (30.0, 40.0), "cell_count": 4}],
+                }
+            }
+
+        agent._semantic_detector = fake_detector
+        agent._remember_blocked_direction_index(3)
+
+        action = agent._semantic_direction_action(frame, [_GameAction.ACTION2, _GameAction.ACTION4])
+
+        self.assertEqual(action, (1, None))
+
+    def test_semantic_direction_action_can_skip_fully_blocked_top_target_for_later_positive_target(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+
+        def fake_detector(grid):
+            return {
+                "components_per_value": {
+                    "4": [{"center": (20.0, 20.0), "cell_count": 4}],
+                    "14": [{"center": (20.0, 40.0), "cell_count": 4}],
+                    "6": [{"center": (30.0, 20.0), "cell_count": 4}],
+                }
+            }
+
+        agent._semantic_detector = fake_detector
+        agent._remember_blocked_direction_index(3)
+
+        action = agent._semantic_direction_action(frame, [_GameAction.ACTION2, _GameAction.ACTION4])
+
+        self.assertEqual(action, (1, None))
+
     def test_semantic_direction_action_breaks_diagonal_tie_with_recent_vertical_momentum(self):
         agent = self.make_agent()
         frame = np.zeros((64, 64), dtype=np.uint8)
@@ -2059,6 +3050,28 @@ class MyAgentUnitTests(unittest.TestCase):
         agent.pr = previous
 
         action = agent._semantic_direction_action(frame, [_GameAction.ACTION2, _GameAction.ACTION4])
+
+        self.assertEqual(action, (1, None))
+
+    def test_semantic_direction_action_avoids_immediate_reverse_when_secondary_axis_is_available(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        previous = np.zeros((64, 64), dtype=np.uint8)
+        previous[0, 0] = 1
+
+        def fake_detector(grid):
+            return {
+                "components_per_value": {
+                    "4": [{"center": (20.0, 20.0), "cell_count": 4}],
+                    "14": [{"center": (24.0, 16.0), "cell_count": 4}],
+                }
+            }
+
+        agent._semantic_detector = fake_detector
+        agent.pai = 3
+        agent.pr = previous
+
+        action = agent._semantic_direction_action(frame, [_GameAction.ACTION2, _GameAction.ACTION3])
 
         self.assertEqual(action, (1, None))
 
@@ -2082,6 +3095,75 @@ class MyAgentUnitTests(unittest.TestCase):
 
         self.assertLess(bonuses[3], 0.0)
         self.assertGreater(bonuses[1], bonuses[3])
+
+    def test_semantic_direction_bonuses_penalize_recent_blocked_direction_history(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+
+        def fake_detector(grid):
+            return {
+                "components_per_value": {
+                    "4": [{"center": (20.0, 20.0), "cell_count": 4}],
+                    "14": [{"center": (30.0, 40.0), "cell_count": 4}],
+                }
+            }
+
+        agent._semantic_detector = fake_detector
+        agent._remember_blocked_direction_index(3)
+
+        bonuses = agent._semantic_direction_bonuses(frame)
+
+        self.assertLess(bonuses[3], 0.0)
+        self.assertGreater(bonuses[1], bonuses[3])
+
+    def test_semantic_direction_bonuses_penalize_immediate_reverse_when_secondary_axis_exists(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        previous = np.zeros((64, 64), dtype=np.uint8)
+        previous[0, 0] = 1
+
+        def fake_detector(grid):
+            return {
+                "components_per_value": {
+                    "4": [{"center": (20.0, 20.0), "cell_count": 4}],
+                    "14": [{"center": (24.0, 16.0), "cell_count": 4}],
+                }
+            }
+
+        agent._semantic_detector = fake_detector
+        agent.pai = 3
+        agent.pr = previous
+
+        bonuses = agent._semantic_direction_bonuses(frame)
+
+        self.assertGreater(bonuses[1], bonuses[2])
+
+    def test_semantic_direction_bonuses_allow_reverse_when_recent_direction_worsened_distance(self):
+        agent = self.make_agent()
+        previous = np.zeros((64, 64), dtype=np.uint8)
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        previous[20, 20] = 4
+        frame[20, 21] = 4
+
+        def fake_detector(grid):
+            grid = np.asarray(grid, dtype=np.uint8)
+            player_x = 20.0 if grid[20, 20] == 4 else 21.0
+            return {
+                "components_per_value": {
+                    "4": [{"center": (20.0, player_x), "cell_count": 1}],
+                    "14": [{"center": (24.0, 18.0), "cell_count": 4}],
+                }
+            }
+
+        agent._semantic_detector = fake_detector
+        agent.pai = 3
+        agent.pr = previous
+        agent.ph = agent._fast_frame_hash(previous)
+
+        bonuses = agent._semantic_direction_bonuses(frame)
+
+        self.assertGreater(bonuses[2], 0.0)
+        self.assertLess(bonuses[2], bonuses[1])
 
     def test_heuristic_opening_skips_blocked_direction_when_state_is_unchanged(self):
         agent = self.make_agent()
@@ -2221,6 +3303,27 @@ class MyAgentUnitTests(unittest.TestCase):
         self.assertIn(1, bonuses)
         self.assertNotIn(3, bonuses)
 
+    def test_semantic_direction_bonuses_can_skip_fully_blocked_top_target_for_later_positive_target(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+
+        def fake_detector(grid):
+            return {
+                "components_per_value": {
+                    "4": [{"center": (20.0, 20.0), "cell_count": 4}],
+                    "14": [{"center": (20.0, 40.0), "cell_count": 4}],
+                    "6": [{"center": (30.0, 20.0), "cell_count": 4}],
+                }
+            }
+
+        agent._semantic_detector = fake_detector
+        agent._remember_blocked_direction_index(3)
+
+        bonuses = agent._semantic_direction_bonuses(frame, [_GameAction.ACTION2, _GameAction.ACTION4])
+
+        self.assertGreater(bonuses[1], 0.0)
+        self.assertNotEqual(max(bonuses, key=bonuses.get), 3)
+
     def test_semantic_exploration_logits_bias_direction_and_click_targets(self):
         import torch
 
@@ -2256,6 +3359,32 @@ class MyAgentUnitTests(unittest.TestCase):
         logits = agent._semantic_exploration_logits(frame, [_GameAction.ACTION2, _GameAction.ACTION4], False)
 
         self.assertTrue(torch.isneginf(logits[3]))
+        self.assertFalse(torch.isneginf(logits[1]))
+
+    def test_semantic_exploration_logits_uses_supplied_availability_summary(self):
+        import torch
+
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        avail_ids = [2, 4]
+        avail_summary = {
+            "has_click": False,
+            "has_undo": False,
+            "has_modeled": True,
+            "legal_dirs": frozenset({2, 4}),
+        }
+
+        with mock.patch.object(agent, "_availability_summary", side_effect=AssertionError("should use supplied availability summary")):
+            logits = agent._semantic_exploration_logits(
+                frame,
+                [_GameAction.ACTION2, _GameAction.ACTION4],
+                False,
+                avail_ids=avail_ids,
+                frame_hash=agent._fast_frame_hash(frame),
+                avail_summary=avail_summary,
+            )
+
+        self.assertEqual(tuple(logits.shape), (5,))
         self.assertFalse(torch.isneginf(logits[1]))
 
     def test_semantic_exploration_logits_penalize_blocked_click(self):
@@ -2294,6 +3423,19 @@ class MyAgentUnitTests(unittest.TestCase):
 
         self.assertTrue(torch.isneginf(logits[5 + 19 * agent.G + 24]))
         self.assertTrue(torch.isneginf(logits[5 + 21 * agent.G + 23]))
+
+    def test_semantic_exploration_logits_penalize_recent_blocked_click_history(self):
+        import torch
+
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        agent._remember_blocked_click_coord((18, 11))
+
+        logits = agent._semantic_exploration_logits(frame, [_GameAction.ACTION6], True)
+
+        self.assertTrue(torch.isneginf(logits[5 + 18 * agent.G + 11]))
+        self.assertTrue(torch.isneginf(logits[5 + 19 * agent.G + 11]))
+        self.assertFalse(torch.isneginf(logits[5 + 21 * agent.G + 14]))
 
     def test_semantic_exploration_logits_downweight_far_clicks_when_player_visible(self):
         agent = self.make_agent()
@@ -2346,6 +3488,57 @@ class MyAgentUnitTests(unittest.TestCase):
         preferred_idx = 5 + preferred[0] * agent.G + preferred[1]
 
         self.assertTrue(torch.isneginf(logits[preferred_idx]))
+
+    def test_semantic_exploration_logits_do_not_boost_preferred_click_from_recent_history_when_current_block_differs(self):
+        import torch
+
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        preferred = (19, 12)
+        decoys = [(0, 0), (1, 1), (2, 2), (3, 3), (4, 4), (5, 5)]
+
+        agent._semantic_target_coord = preferred
+        agent._semantic_click_targets = lambda raw, limit=6: decoys[:limit]
+        agent._remember_blocked_click_coord(preferred)
+
+        logits = agent._semantic_exploration_logits(
+            frame,
+            [_GameAction.ACTION6],
+            True,
+            blocked_click_coord=(0, 0),
+            frame_hash=agent._fast_frame_hash(frame),
+        )
+        preferred_idx = 5 + preferred[0] * agent.G + preferred[1]
+
+        self.assertTrue(torch.isneginf(logits[preferred_idx]))
+
+    def test_semantic_exploration_logits_do_not_boost_stale_preferred_click_target(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        preferred = (32, 42)
+        decoys = [(0, 0), (1, 1), (2, 2), (3, 3), (4, 4), (5, 5)]
+
+        agent._semantic_target_coord = preferred
+        agent._semantic_click_targets = lambda raw, limit=6: decoys[:limit]
+        agent._unproductive = 6
+
+        logits = agent._semantic_exploration_logits(frame, [_GameAction.ACTION6], True)
+        preferred_idx = 5 + preferred[0] * agent.G + preferred[1]
+
+        self.assertEqual(logits[preferred_idx].item(), 0.0)
+        self.assertAlmostEqual(logits[5 + 0 * agent.G + 0].item(), 0.8, places=6)
+
+    def test_semantic_exploration_logits_include_raw_fallback_click_targets(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        frame[18:20, 18:20] = 3
+        frame[30:32, 40:42] = 5
+        agent._semantic_detector = lambda grid: {"components_per_value": {}}
+
+        logits = agent._semantic_exploration_logits(frame, [_GameAction.ACTION6], True)
+
+        self.assertGreater(logits[5 + 18 * agent.G + 18].item(), 0.0)
+        self.assertGreater(logits[5 + 30 * agent.G + 40].item(), 0.0)
 
     def test_semantic_goal_distance_uses_raw_frame_fallback_without_detector(self):
         agent = self.make_agent()
@@ -2409,6 +3602,93 @@ class MyAgentUnitTests(unittest.TestCase):
         self.assertNotIn(5 + preferred[0] * agent.G + preferred[1], indices)
         self.assertIn(5 + 0 * agent.G + 0, indices)
 
+    def test_semantic_candidate_action_indices_skip_preferred_click_from_recent_history_when_current_block_differs(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        preferred = (19, 12)
+        decoys = [(0, 0), (1, 1), (2, 2), (3, 3), (4, 4), (5, 5)]
+
+        agent._semantic_target_coord = preferred
+        agent._semantic_click_targets = lambda raw, limit=6: decoys[:limit]
+        agent._remember_blocked_click_coord(preferred)
+
+        indices = agent._semantic_candidate_action_indices(
+            frame,
+            True,
+            blocked_click_coord=(0, 0),
+            frame_hash=agent._fast_frame_hash(frame),
+        )
+
+        self.assertNotIn(5 + preferred[0] * agent.G + preferred[1], indices)
+        self.assertIn(5 + 0 * agent.G + 0, indices)
+
+    def test_semantic_candidate_action_indices_skip_stale_preferred_click_target(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        preferred = (32, 42)
+        decoys = [(0, 0), (1, 1), (2, 2), (3, 3), (4, 4), (5, 5)]
+
+        agent._semantic_target_coord = preferred
+        agent._semantic_click_targets = lambda raw, limit=6: decoys[:limit]
+        agent._unproductive = 6
+
+        indices = agent._semantic_candidate_action_indices(frame, True)
+
+        self.assertNotIn(5 + preferred[0] * agent.G + preferred[1], indices)
+        self.assertIn(5 + 0 * agent.G + 0, indices)
+
+    def test_semantic_candidate_action_indices_include_raw_fallback_click_targets(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        frame[18:20, 18:20] = 3
+        frame[30:32, 40:42] = 5
+        agent._semantic_detector = lambda grid: {"components_per_value": {}}
+
+        indices = agent._semantic_candidate_action_indices(frame, True)
+
+        self.assertIn(5 + 18 * agent.G + 18, indices)
+        self.assertIn(5 + 30 * agent.G + 40, indices)
+
+    def test_semantic_candidate_action_indices_reuse_cached_click_shortlist(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        frame_hash = agent._fast_frame_hash(frame)
+        calls = {"semantic": 0, "fallback": 0}
+
+        agent._semantic_direction_bonuses = lambda *args, **kwargs: {3: 0.45}
+
+        def fake_semantic_targets(raw, limit=6, blocked_click_coord=None, frame_hash=None):
+            calls["semantic"] += 1
+            return [(22, 40)]
+
+        def fake_fallback_targets(raw, blocked_click_coord=None, frame_hash=None):
+            calls["fallback"] += 1
+            return [(30, 40)]
+
+        agent._semantic_click_targets = fake_semantic_targets
+        agent._heuristic_click_fallback_targets = fake_fallback_targets
+
+        first = agent._semantic_candidate_action_indices(frame, True, frame_hash=frame_hash)
+        second = agent._semantic_candidate_action_indices(frame, True, frame_hash=frame_hash)
+
+        self.assertEqual(first, second)
+        self.assertEqual(calls["semantic"], 1)
+        self.assertEqual(calls["fallback"], 1)
+        self.assertIn(5 + 22 * agent.G + 40, first)
+        self.assertIn(5 + 30 * agent.G + 40, first)
+
+    def test_semantic_candidate_action_indices_include_wait_for_stalled_recovery(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        agent._unproductive = 6
+        agent._remember_blocked_direction_index(1)
+        agent._remember_blocked_direction_index(3)
+        agent._semantic_detector = lambda grid: {"components_per_value": {}}
+
+        indices = agent._semantic_candidate_action_indices(frame, False, avail_ids=[2, 4, 5], frame_hash=agent._fast_frame_hash(frame))
+
+        self.assertIn(4, indices)
+
     def test_cnn_rescoring_prefers_semantic_direction_without_bfs(self):
         agent = self.make_agent()
         frame = _make_frame(0, actions=[_GameAction.ACTION2, _GameAction.ACTION4], levels=0)
@@ -2433,6 +3713,128 @@ class MyAgentUnitTests(unittest.TestCase):
 
         self.assertEqual(result.value, 4)
         self.assertEqual(result.reasoning, "cnn:a4")
+
+    def test_cnn_rescoring_prefers_wait_when_stuck_and_frontiers_are_exhausted(self):
+        agent = self.make_agent()
+        frame = _make_frame(0, actions=[_GameAction.ACTION2, _GameAction.ACTION4, _GameAction.ACTION5], levels=0)
+        logits = np.array([-10.0, 9.0, -10.0, 8.5, -2.0], dtype=np.float32)
+
+        agent.cl = 0
+        agent._wd = True
+        agent._eps = 0.0
+        agent._unproductive = 6
+        agent._remember_blocked_direction_index(1)
+        agent._remember_blocked_direction_index(3)
+        agent._semantic_detector = lambda grid: {"components_per_value": {}}
+        agent.net = _ForwardOnlyNet(logits, agent.device)
+        agent._bfs = None
+
+        result = agent.choose_action([], frame)
+
+        self.assertEqual(result.value, 5)
+        self.assertEqual(result.reasoning, "cnn:a5")
+
+    def test_modeled_frontier_exhausted_requires_no_wait_and_no_unblocked_frontier(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        agent._semantic_detector = lambda grid: {"components_per_value": {}}
+        agent._remember_blocked_direction_index(1)
+        agent._remember_blocked_direction_index(3)
+
+        self.assertTrue(agent._modeled_frontier_exhausted(frame, [2, 4], frame_hash=agent._fast_frame_hash(frame)))
+        self.assertFalse(agent._modeled_frontier_exhausted(frame, [2, 4, 5], frame_hash=agent._fast_frame_hash(frame)))
+
+    def test_modeled_frontier_exhausted_treats_wait_as_exhausted_after_stale_wait(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        agent._semantic_detector = lambda grid: {"components_per_value": {}}
+        agent._remember_blocked_direction_index(1)
+        agent._remember_blocked_direction_index(3)
+        agent._unproductive = 7
+        agent.pai = 4
+        agent.pr = frame.copy()
+
+        self.assertTrue(agent._modeled_frontier_exhausted(frame, [2, 4, 5], frame_hash=agent._fast_frame_hash(frame)))
+
+    def test_choose_action_prefers_undo_when_modeled_frontier_is_exhausted(self):
+        agent = self.make_agent()
+        frame = _make_frame(0, actions=[_GameAction.ACTION2, _GameAction.ACTION4, _GameAction.ACTION7], levels=0)
+        logits = np.array([-10.0, 9.0, -10.0, 8.5, -2.0], dtype=np.float32)
+
+        agent.cl = 0
+        agent._wd = True
+        agent._eps = 0.0
+        agent._ckpt_hash = 99
+        agent._remember_blocked_direction_index(1)
+        agent._remember_blocked_direction_index(3)
+        agent._semantic_detector = lambda grid: {"components_per_value": {}}
+        agent.net = _ForwardOnlyNet(logits, agent.device)
+        agent._bfs = None
+
+        result = agent.choose_action([], frame)
+
+        self.assertEqual(result.value, 7)
+        self.assertEqual(result.reasoning, "undo-frontier")
+
+    def test_choose_action_prefers_undo_after_stale_wait_recovery(self):
+        agent = self.make_agent()
+        frame = _make_frame(0, actions=[_GameAction.ACTION2, _GameAction.ACTION4, _GameAction.ACTION5, _GameAction.ACTION7], levels=0)
+        logits = np.array([-10.0, 9.0, -10.0, 8.5, 7.5], dtype=np.float32)
+
+        agent.cl = 0
+        agent._wd = True
+        agent._eps = 0.0
+        agent._ckpt_hash = 99
+        agent._unproductive = 6
+        agent.pt = object()
+        agent.pai = 4
+        agent.pr = frame.frame[-1].copy()
+        agent.ph = agent._fast_frame_hash(agent.pr)
+        agent._remember_blocked_direction_index(1)
+        agent._remember_blocked_direction_index(3)
+        agent._semantic_detector = lambda grid: {"components_per_value": {}}
+        agent.net = _ForwardOnlyNet(logits, agent.device)
+        agent._bfs = None
+
+        result = agent.choose_action([], frame)
+
+        self.assertEqual(result.value, 7)
+        self.assertEqual(result.reasoning, "undo-frontier")
+
+    def test_retry_blocked_direction_after_stale_wait_requires_no_other_frontier(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        agent._unproductive = 7
+        agent.pai = 4
+        agent.pr = frame.copy()
+        agent._remember_blocked_direction_index(1)
+        agent._semantic_detector = lambda grid: {"components_per_value": {}}
+
+        self.assertTrue(agent._retry_blocked_direction_after_stale_wait(frame, [2, 5], frame_hash=agent._fast_frame_hash(frame)))
+        self.assertFalse(agent._retry_blocked_direction_after_stale_wait(frame, [2, 4, 5], frame_hash=agent._fast_frame_hash(frame)))
+
+    def test_cnn_rescoring_retries_blocked_direction_after_stale_wait(self):
+        agent = self.make_agent()
+        frame = _make_frame(0, actions=[_GameAction.ACTION2, _GameAction.ACTION5], levels=0)
+        logits = np.array([-10.0, 8.0, -10.0, -10.0, 9.5], dtype=np.float32)
+
+        agent.cl = 0
+        agent._wd = True
+        agent._eps = 0.0
+        agent._unproductive = 6
+        agent.pt = object()
+        agent.pai = 4
+        agent.pr = frame.frame[-1].copy()
+        agent.ph = agent._fast_frame_hash(agent.pr)
+        agent._remember_blocked_direction_index(1)
+        agent._semantic_detector = lambda grid: {"components_per_value": {}}
+        agent.net = _ForwardOnlyNet(logits, agent.device)
+        agent._bfs = None
+
+        result = agent.choose_action([], frame)
+
+        self.assertEqual(result.value, 2)
+        self.assertEqual(result.reasoning, "cnn:a2")
 
     def test_cnn_rescoring_breaks_equal_direction_ties_with_recent_momentum(self):
         agent = self.make_agent()
@@ -2633,6 +4035,31 @@ class MyAgentUnitTests(unittest.TestCase):
         self.assertEqual(result.value, 6)
         self.assertEqual(result.data, {"x": 40, "y": 22})
 
+    def test_cnn_rescoring_avoids_recent_blocked_click_history_even_with_hotter_logit(self):
+        agent = self.make_agent()
+        frame = _make_frame(0, actions=[_GameAction.ACTION6], levels=0)
+        frame.frame[-1][18:20, 18:20] = 3
+        frame.frame[-1][30:32, 40:42] = 5
+        blocked_idx = 5 + 18 * agent.G + 18
+        safe_idx = 5 + 30 * agent.G + 40
+        logits = np.full(4101, -10.0, dtype=np.float32)
+        logits[blocked_idx] = 9.0
+        logits[safe_idx] = 8.0
+
+        agent._remember_blocked_click_coord((18, 18))
+        agent._semantic_detector = lambda grid: {"components_per_value": {}}
+        agent.cl = 0
+        agent._wd = True
+        agent._eps = 0.0
+        agent.net = _ForwardOnlyNet(logits, agent.device)
+        agent._bfs = None
+        agent._wm = np.ones((64, 64), dtype=np.float32)
+
+        result = agent.choose_action([], frame)
+
+        self.assertEqual(result.value, 6)
+        self.assertEqual(result.data, {"x": 40, "y": 30})
+
     def test_cnn_rescoring_avoids_nearby_blocked_click_jitter_when_scores_are_close(self):
         agent = self.make_agent()
         frame = _make_frame(0, actions=[_GameAction.ACTION6], levels=0)
@@ -2824,6 +4251,33 @@ class MyAgentUnitTests(unittest.TestCase):
         self.assertEqual(result.value, 6)
         self.assertEqual(result.data, {"x": 42, "y": 32})
 
+    def test_cnn_rescoring_considers_raw_fallback_click_target_outside_top_list(self):
+        agent = self.make_agent()
+        frame = _make_frame(0, actions=[_GameAction.ACTION6], levels=0)
+        frame.frame[-1][18:20, 18:20] = 3
+        frame.frame[-1][30:32, 40:42] = 5
+        preferred = (30, 40)
+        preferred_idx = 5 + preferred[0] * agent.G + preferred[1]
+        decoys = [(0, 0), (1, 1), (2, 2), (3, 3), (4, 4), (5, 5)]
+        logits = np.full(4101, -10.0, dtype=np.float32)
+        for rank, (y, x) in enumerate(decoys):
+            logits[5 + y * agent.G + x] = 7.20 - rank * 0.01
+        logits[preferred_idx] = 7.16
+
+        agent.cl = 0
+        agent._wd = True
+        agent._eps = 0.0
+        agent.net = _FixedLogitNet(logits, agent.device)
+        agent._bfs = None
+        agent._wm = np.ones((64, 64), dtype=np.float32)
+        agent._semantic_detector = lambda grid: {"components_per_value": {}}
+        agent._semantic_target_coord = preferred
+
+        result = agent.choose_action([], frame)
+
+        self.assertEqual(result.value, 6)
+        self.assertEqual(result.data, {"x": 40, "y": 30})
+
     def test_epsilon_exploration_uses_semantic_biases(self):
         import torch
 
@@ -2851,6 +4305,278 @@ class MyAgentUnitTests(unittest.TestCase):
 
         self.assertEqual(result.value, 4)
         self.assertEqual(result.reasoning, "cnn:a4")
+
+    def test_sample_semantic_exploration_restricts_clicks_to_semantic_candidates(self):
+        import torch
+
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        logits = torch.zeros(4101, dtype=torch.float32, device=agent.device)
+        semantic_coord = (22, 40)
+        decoy_coord = (10, 10)
+        semantic_idx = 5 + semantic_coord[0] * agent.G + semantic_coord[1]
+        decoy_idx = 5 + decoy_coord[0] * agent.G + decoy_coord[1]
+        logits[semantic_idx] = 0.7
+        logits[decoy_idx] = 0.9
+
+        agent._semantic_click_targets = lambda raw, limit=8, blocked_click_coord=None, frame_hash=None: [semantic_coord]
+
+        def fake_multinomial(probs, num_samples):
+            self.assertGreater(float(probs[semantic_idx].item()), 0.0)
+            self.assertEqual(float(probs[decoy_idx].item()), 0.0)
+            return torch.tensor([semantic_idx], device=agent.device)
+
+        with mock.patch.object(self.mod.torch, "multinomial", side_effect=fake_multinomial):
+            action_idx, coords = agent._sample_semantic_exploration(
+                logits,
+                frame,
+                [_GameAction.ACTION6],
+                avail_ids=[6],
+            )
+
+        self.assertEqual(action_idx, 5)
+        self.assertEqual(coords, semantic_coord)
+
+    def test_sample_semantic_exploration_includes_raw_fallback_click_candidates(self):
+        import torch
+
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        frame[18:20, 18:20] = 3
+        frame[30:32, 40:42] = 5
+        logits = torch.zeros(4101, dtype=torch.float32, device=agent.device)
+        fallback_coord = (30, 40)
+        decoy_coord = (10, 10)
+        fallback_idx = 5 + fallback_coord[0] * agent.G + fallback_coord[1]
+        decoy_idx = 5 + decoy_coord[0] * agent.G + decoy_coord[1]
+        logits[fallback_idx] = 0.7
+        logits[decoy_idx] = 0.9
+        agent._semantic_detector = lambda grid: {"components_per_value": {}}
+
+        def fake_multinomial(probs, num_samples):
+            self.assertGreater(float(probs[fallback_idx].item()), 0.0)
+            self.assertEqual(float(probs[decoy_idx].item()), 0.0)
+            return torch.tensor([fallback_idx], device=agent.device)
+
+        with mock.patch.object(self.mod.torch, "multinomial", side_effect=fake_multinomial):
+            action_idx, coords = agent._sample_semantic_exploration(
+                logits,
+                frame,
+                [_GameAction.ACTION6],
+                avail_ids=[6],
+            )
+
+        self.assertEqual(action_idx, 5)
+        self.assertEqual(coords, fallback_coord)
+
+    def test_sample_semantic_exploration_excludes_preferred_click_from_recent_history_when_current_block_differs(self):
+        import torch
+
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        logits = torch.zeros(4101, dtype=torch.float32, device=agent.device)
+        preferred = (19, 12)
+        decoy_coord = (10, 10)
+        preferred_idx = 5 + preferred[0] * agent.G + preferred[1]
+        decoy_idx = 5 + decoy_coord[0] * agent.G + decoy_coord[1]
+        logits[preferred_idx] = 0.9
+        logits[decoy_idx] = 0.7
+
+        agent._semantic_target_coord = preferred
+        agent._semantic_click_targets = lambda raw, limit=8, blocked_click_coord=None, frame_hash=None: [decoy_coord]
+        agent._remember_blocked_click_coord(preferred)
+
+        def fake_multinomial(probs, num_samples):
+            self.assertEqual(float(probs[preferred_idx].item()), 0.0)
+            self.assertGreater(float(probs[decoy_idx].item()), 0.0)
+            return torch.tensor([decoy_idx], device=agent.device)
+
+        with mock.patch.object(self.mod.torch, "multinomial", side_effect=fake_multinomial):
+            action_idx, coords = agent._sample_semantic_exploration(
+                logits,
+                frame,
+                [_GameAction.ACTION6],
+                avail_ids=[6],
+                blocked_click_coord=(0, 0),
+                frame_hash=agent._fast_frame_hash(frame),
+            )
+
+        self.assertEqual(action_idx, 5)
+        self.assertEqual(coords, decoy_coord)
+
+    def test_sample_semantic_exploration_excludes_stale_preferred_click_target(self):
+        import torch
+
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        logits = torch.zeros(4101, dtype=torch.float32, device=agent.device)
+        preferred = (32, 42)
+        decoy_coord = (10, 10)
+        preferred_idx = 5 + preferred[0] * agent.G + preferred[1]
+        decoy_idx = 5 + decoy_coord[0] * agent.G + decoy_coord[1]
+        logits[preferred_idx] = 0.9
+        logits[decoy_idx] = 0.7
+
+        agent._semantic_target_coord = preferred
+        agent._semantic_click_targets = lambda raw, limit=8, blocked_click_coord=None, frame_hash=None: [decoy_coord]
+        agent._unproductive = 6
+
+        def fake_multinomial(probs, num_samples):
+            self.assertEqual(float(probs[preferred_idx].item()), 0.0)
+            self.assertGreater(float(probs[decoy_idx].item()), 0.0)
+            return torch.tensor([decoy_idx], device=agent.device)
+
+        with mock.patch.object(self.mod.torch, "multinomial", side_effect=fake_multinomial):
+            action_idx, coords = agent._sample_semantic_exploration(
+                logits,
+                frame,
+                [_GameAction.ACTION6],
+                avail_ids=[6],
+                frame_hash=agent._fast_frame_hash(frame),
+            )
+
+        self.assertEqual(action_idx, 5)
+        self.assertEqual(coords, decoy_coord)
+
+    def test_sample_sparse_policy_indices_limits_click_mass_to_candidates(self):
+        import torch
+
+        agent = self.make_agent()
+        logits = torch.full((4101,), -float("inf"), dtype=torch.float32, device=agent.device)
+        allowed_click = (22, 40)
+        blocked_click = (10, 10)
+        allowed_idx = 5 + allowed_click[0] * agent.G + allowed_click[1]
+        blocked_idx = 5 + blocked_click[0] * agent.G + blocked_click[1]
+        logits[1] = 0.5
+        logits[allowed_idx] = 0.9
+        logits[blocked_idx] = 0.95
+
+        def fake_multinomial(probs, num_samples):
+            self.assertGreater(float(probs[1].item()), 0.0)
+            self.assertGreater(float(probs[allowed_idx].item()), 0.0)
+            self.assertEqual(float(probs[blocked_idx].item()), 0.0)
+            return torch.tensor([allowed_idx], device=agent.device)
+
+        with mock.patch.object(self.mod.torch, "multinomial", side_effect=fake_multinomial):
+            action_idx, coords = agent._sample_sparse_policy_indices(
+                logits,
+                [2, 6],
+                [allowed_idx],
+            )
+
+        self.assertEqual(action_idx, 5)
+        self.assertEqual(coords, allowed_click)
+
+    def test_candidate_score_map_batches_candidate_reads(self):
+        import torch
+
+        agent = self.make_agent()
+        scored = torch.tensor([0.2, -1.0, 3.5, 0.7], dtype=torch.float32, device=agent.device)
+
+        score_map = agent._candidate_score_map(scored, [2, 0, 3])
+
+        self.assertEqual(set(score_map.keys()), {2, 0, 3})
+        self.assertAlmostEqual(score_map[2], 3.5, places=6)
+        self.assertAlmostEqual(score_map[0], 0.2, places=6)
+        self.assertAlmostEqual(score_map[3], 0.7, places=6)
+
+    def test_epsilon_exploration_clicks_use_sparse_semantic_candidates(self):
+        import torch
+
+        agent = self.make_agent()
+        frame = _make_frame(0, actions=[_GameAction.ACTION6], levels=0)
+
+        def fake_detector(grid):
+            return {
+                "components_per_value": {
+                    "4": [{"center": (20.0, 20.0), "cell_count": 4}],
+                    "14": [{"center": (22.0, 40.0), "cell_count": 4}],
+                }
+            }
+
+        semantic_idx = 5 + 22 * agent.G + 40
+        decoy_idx = 5 + 10 * agent.G + 10
+
+        agent._semantic_detector = fake_detector
+        agent.cl = 0
+        agent._wd = True
+        agent._eps = 1.0
+        agent.net = _FixedLogitNet(np.zeros(4101, dtype=np.float32), agent.device)
+        agent._bfs = None
+
+        def fake_multinomial(probs, num_samples):
+            self.assertGreater(float(probs[semantic_idx].item()), 0.0)
+            self.assertEqual(float(probs[decoy_idx].item()), 0.0)
+            return torch.tensor([semantic_idx], device=agent.device)
+
+        with mock.patch.object(self.mod.random, "random", return_value=0.0):
+            with mock.patch.object(self.mod.torch, "multinomial", side_effect=fake_multinomial):
+                result = agent.choose_action([], frame)
+
+        self.assertEqual(result.value, 6)
+        self.assertEqual(result.data, {"x": 40, "y": 22})
+        self.assertEqual(result.reasoning, "cnn:c(40,22)")
+
+    def test_epsilon_exploration_clicks_can_use_raw_fallback_candidates(self):
+        import torch
+
+        agent = self.make_agent()
+        frame = _make_frame(0, actions=[_GameAction.ACTION6], levels=0)
+        frame.frame[-1][18:20, 18:20] = 3
+        frame.frame[-1][30:32, 40:42] = 5
+        fallback_idx = 5 + 30 * agent.G + 40
+        decoy_idx = 5 + 10 * agent.G + 10
+
+        agent._semantic_detector = lambda grid: {"components_per_value": {}}
+        agent.cl = 0
+        agent._wd = True
+        agent._eps = 1.0
+        agent.net = _FixedLogitNet(np.zeros(4101, dtype=np.float32), agent.device)
+        agent._bfs = None
+
+        def fake_multinomial(probs, num_samples):
+            self.assertGreater(float(probs[fallback_idx].item()), 0.0)
+            self.assertEqual(float(probs[decoy_idx].item()), 0.0)
+            return torch.tensor([fallback_idx], device=agent.device)
+
+        with mock.patch.object(self.mod.random, "random", return_value=0.0):
+            with mock.patch.object(self.mod.torch, "multinomial", side_effect=fake_multinomial):
+                result = agent.choose_action([], frame)
+
+        self.assertEqual(result.value, 6)
+        self.assertEqual(result.data, {"x": 40, "y": 30})
+        self.assertEqual(result.reasoning, "cnn:c(40,30)")
+
+    def test_epsilon_exploration_prefers_stronger_raw_fallback_click_logit(self):
+        import torch
+
+        agent = self.make_agent()
+        frame = _make_frame(0, actions=[_GameAction.ACTION6], levels=0)
+        frame.frame[-1][18:20, 18:20] = 3
+        frame.frame[-1][30:32, 40:42] = 5
+        first_idx = 5 + 18 * agent.G + 18
+        second_idx = 5 + 30 * agent.G + 40
+        logits = np.full(4101, -10.0, dtype=np.float32)
+        logits[first_idx] = 7.0
+        logits[second_idx] = 7.3
+
+        agent._semantic_detector = lambda grid: {"components_per_value": {}}
+        agent.cl = 0
+        agent._wd = True
+        agent._eps = 1.0
+        agent.net = _FixedLogitNet(logits, agent.device)
+        agent._bfs = None
+
+        def fake_multinomial(probs, num_samples):
+            self.assertGreater(float(probs[second_idx].item()), float(probs[first_idx].item()))
+            return torch.tensor([second_idx], device=agent.device)
+
+        with mock.patch.object(self.mod.random, "random", return_value=0.0):
+            with mock.patch.object(self.mod.torch, "multinomial", side_effect=fake_multinomial):
+                result = agent.choose_action([], frame)
+
+        self.assertEqual(result.value, 6)
+        self.assertEqual(result.data, {"x": 40, "y": 30})
 
     def test_cnn_rescoring_prefers_semantic_click_target(self):
         agent = self.make_agent()
@@ -2939,6 +4665,56 @@ class MyAgentUnitTests(unittest.TestCase):
         self.assertEqual(action_idx, 4)
         self.assertIsNone(coords)
 
+    def test_heuristic_retries_blocked_direction_after_stale_wait(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        agent._bg = 0
+        agent._unproductive = 7
+        agent.pai = 4
+        agent.pr = frame.copy()
+        agent._remember_blocked_direction_index(1)
+
+        with mock.patch.object(self.mod.random, "choice", return_value=2) as choice_mock:
+            action_idx, coords = agent._heuristic(frame, [_GameAction.ACTION2, _GameAction.ACTION5], step=9)
+
+        self.assertEqual(action_idx, 1)
+        self.assertIsNone(coords)
+        self.assertEqual(choice_mock.call_args.args[0], [2])
+
+    def test_prime_warmup_action_exits_early_for_wait_recovery(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        agent.la = 3
+        agent._unproductive = 6
+        agent._remember_blocked_direction_index(1)
+        agent._remember_blocked_direction_index(3)
+        agent._semantic_detector = lambda grid: {"components_per_value": {}}
+        train_calls = []
+        agent._maybe_train = lambda max_steps=0, force=False: train_calls.append((max_steps, force))
+
+        result = agent._prime_warmup_action(frame, [_GameAction.ACTION2, _GameAction.ACTION4, _GameAction.ACTION5], frame_hash=agent._fast_frame_hash(frame))
+
+        self.assertIsNone(result)
+        self.assertTrue(agent._wd)
+        self.assertEqual(train_calls, [(0, True)])
+
+    def test_prime_warmup_action_exits_early_for_exhausted_frontier(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        agent.la = 3
+        agent._unproductive = 6
+        agent._remember_blocked_direction_index(1)
+        agent._remember_blocked_direction_index(3)
+        agent._semantic_detector = lambda grid: {"components_per_value": {}}
+        train_calls = []
+        agent._maybe_train = lambda max_steps=0, force=False: train_calls.append((max_steps, force))
+
+        result = agent._prime_warmup_action(frame, [_GameAction.ACTION2, _GameAction.ACTION4], frame_hash=agent._fast_frame_hash(frame))
+
+        self.assertIsNone(result)
+        self.assertTrue(agent._wd)
+        self.assertEqual(train_calls, [(0, True)])
+
     def test_heuristic_retries_blocked_direction_when_no_wait_exists(self):
         agent = self.make_agent()
         frame = np.zeros((64, 64), dtype=np.uint8)
@@ -2970,8 +4746,10 @@ class MyAgentUnitTests(unittest.TestCase):
         agent.buf_actions = self.mod.array('H', [0, 1, 2, 3, 4])
         agent.buf_rewards = self.mod.array('f', [0.1, 2.0, 1.5, 0.2, 3.0])
         agent.buf_next_frames = [None] * 5
-        agent.buf_priorities = [0.11, 2.01, 1.51, 0.21, 3.01]
+        agent.buf_has_next = self.mod.array('b', [0, 0, 0, 0, 0])
+        agent.buf_priorities = self.mod.array('f', [0.11, 2.01, 1.51, 0.21, 3.01])
         agent.buf_keys = [("k0", 0), ("k1", 1), None, ("k3", 3), ("k4", 4)]
+        agent.buf_key_counts = {("stale", 9): 1}
         agent.buf_h = {("old", 1)}
         agent.buf_pos = 4
 
@@ -2981,6 +4759,7 @@ class MyAgentUnitTests(unittest.TestCase):
         self.assertEqual(sorted(float(x) for x in agent.buf_rewards), [2.0, 3.0])
         self.assertEqual(list(agent.buf_actions), [1, 4])
         self.assertEqual(agent.buf_keys, [("k1", 1), ("k4", 4)])
+        self.assertEqual(agent.buf_key_counts, {("k1", 1): 1, ("k4", 4): 1})
         self.assertEqual(agent.buf_h, {("k1", 1), ("k4", 4)})
         self.assertEqual(agent.buf_pos, 0)
 
@@ -2990,8 +4769,11 @@ class MyAgentUnitTests(unittest.TestCase):
         agent.buf_actions = self.mod.array('H', [3])
         agent.buf_rewards = self.mod.array('f', [1.25])
         agent.buf_next_frames = [np.zeros((64, 64), dtype=np.uint8)]
-        agent.buf_priorities = [1.26]
+        agent.buf_has_next = self.mod.array('b', [1])
+        agent.buf_priorities = self.mod.array('f', [1.26])
         agent.buf_keys = [("seen", 3)]
+        agent.buf_hashes = self.mod.array('I', [123456789])
+        agent.buf_key_counts = {("seen", 3): 1}
         agent.buf_h = {("seen", 3)}
         agent.buf_pos = 7
 
@@ -3001,8 +4783,11 @@ class MyAgentUnitTests(unittest.TestCase):
         self.assertEqual(list(agent.buf_actions), [])
         self.assertEqual(list(agent.buf_rewards), [])
         self.assertEqual(agent.buf_next_frames, [])
-        self.assertEqual(agent.buf_priorities, [])
+        self.assertEqual(list(agent.buf_has_next), [])
+        self.assertEqual(list(agent.buf_priorities), [])
         self.assertEqual(agent.buf_keys, [])
+        self.assertEqual(list(agent.buf_hashes), [])
+        self.assertEqual(agent.buf_key_counts, {})
         self.assertEqual(agent.buf_h, set())
         self.assertEqual(agent.buf_pos, 0)
 
@@ -3014,8 +4799,11 @@ class MyAgentUnitTests(unittest.TestCase):
         agent.buf_actions = self.mod.array('H', [0, 1, 2])
         agent.buf_rewards = self.mod.array('f', [0.1, 0.2, 0.3])
         agent.buf_next_frames = [None, None, None]
-        agent.buf_priorities = [0.11, 0.21, 0.31]
+        agent.buf_has_next = self.mod.array('b', [0, 0, 0])
+        agent.buf_priorities = self.mod.array('f', [0.11, 0.21, 0.31])
         agent.buf_keys = [("k0", 0), None, ("k2", 2)]
+        agent.buf_hashes = self.mod.array('I', [11, 12, 13])
+        agent.buf_key_counts = {("keep", 1): 1}
         agent.buf_h = {("keep", 1)}
         agent.buf_pos = 2
 
@@ -3025,6 +4813,9 @@ class MyAgentUnitTests(unittest.TestCase):
         self.assertTrue(all(np.array_equal(a, b) for a, b in zip(agent.buf, frames)))
         self.assertEqual(list(agent.buf_actions), [0, 1, 2])
         self.assertTrue(np.allclose(list(agent.buf_rewards), [0.1, 0.2, 0.3]))
+        self.assertEqual(list(agent.buf_has_next), [0, 0, 0])
+        self.assertEqual(list(agent.buf_hashes), [11, 12, 13])
+        self.assertEqual(agent.buf_key_counts, {("keep", 1): 1})
         self.assertEqual(agent.buf_h, {("keep", 1)})
         self.assertEqual(agent.buf_keys, [("k0", 0), None, ("k2", 2)])
         self.assertEqual(agent.buf_pos, 2)
@@ -3043,7 +4834,8 @@ class MyAgentUnitTests(unittest.TestCase):
         agent.buf_actions = self.mod.array('H', [0, 1, 2])
         agent.buf_rewards = self.mod.array('f', [0.1, 0.2, 0.3])
         agent.buf_next_frames = [None, None, None]
-        agent.buf_priorities = [0.11, 0.21, 0.31]
+        agent.buf_has_next = self.mod.array('b', [0, 0, 0])
+        agent.buf_priorities = self.mod.array('f', [0.11, 0.21, 0.31])
         agent.buf_keys = [("k0", 0), None, ("k2", 2)]
         agent.buf_h = {("stale", 7)}
 
@@ -3086,7 +4878,13 @@ class MyAgentUnitTests(unittest.TestCase):
         self.assertEqual(list(agent.buf_actions), [65535, 2])
         self.assertTrue(np.array_equal(agent.buf[0], frame2))
         self.assertTrue(np.array_equal(agent.buf[1], frame1))
+        self.assertEqual(list(agent.buf_has_next), [0, 0])
         self.assertEqual(agent.buf_keys, [("f2", 65535), ("f1", 2)])
+        self.assertEqual(
+            list(agent.buf_hashes),
+            [agent._fast_frame_hash(frame2), agent._fast_frame_hash(frame1)],
+        )
+        self.assertEqual(agent.buf_key_counts, {("f1", 2): 1, ("f2", 65535): 1})
         self.assertEqual(agent.buf_h, {("f2", 65535), ("f1", 2)})
 
     def test_add_replay_overwrite_removes_evicted_dedup_key(self):
@@ -3099,7 +4897,69 @@ class MyAgentUnitTests(unittest.TestCase):
         agent._add_replay(frame1, 2, 0.2, dedup_key=("f1", 2))
 
         self.assertEqual(agent.buf_keys, [("f1", 2)])
+        self.assertEqual(list(agent.buf_has_next), [0])
+        self.assertEqual(agent.buf_key_counts, {("f1", 2): 1})
         self.assertEqual(agent.buf_h, {("f1", 2)})
+
+    def test_add_replay_overwrite_preserves_shared_dedup_key_membership(self):
+        agent = self.make_agent()
+        agent.buf_max = 2
+        frame0 = np.zeros((64, 64), dtype=np.uint8)
+        frame1 = np.ones((64, 64), dtype=np.uint8)
+        frame2 = np.full((64, 64), 2, dtype=np.uint8)
+        shared = ("dup", 1)
+
+        agent._add_replay(frame0, 1, 0.1, dedup_key=shared)
+        agent._add_replay(frame1, 2, 0.2, dedup_key=shared)
+        agent._add_replay(frame2, 3, 0.3, dedup_key=("new", 3))
+
+        self.assertEqual(agent.buf_keys, [("new", 3), shared])
+        self.assertEqual(list(agent.buf_has_next), [0, 0])
+        self.assertEqual(agent.buf_key_counts, {shared: 1, ("new", 3): 1})
+        self.assertEqual(agent.buf_h, {shared, ("new", 3)})
+
+    def test_add_replay_normalizes_out_of_palette_snapshot_once(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        frame[7, 9] = 42
+
+        agent._add_replay(frame, 1, 0.5)
+
+        self.assertEqual(int(agent.buf[0][7, 9]), 0)
+        self.assertTrue(agent.buf[0].flags["C_CONTIGUOUS"])
+        self.assertEqual(list(agent.buf_has_next), [0])
+        self.assertEqual(list(agent.buf_hashes), [agent._fast_frame_hash(agent.buf[0])])
+
+    def test_add_replay_tracks_next_frame_presence_in_packed_buffer(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        next_frame = np.ones((64, 64), dtype=np.uint8)
+
+        agent._add_replay(frame, 1, 0.5, next_frame=next_frame)
+        agent._add_replay(frame, 2, 0.1)
+
+        self.assertEqual(list(agent.buf_has_next), [1, 0])
+
+    def test_clear_replay_prunes_hashes_with_retained_entries(self):
+        agent = self.make_agent()
+        agent.bsz = 2
+        frames = [np.full((64, 64), i, dtype=np.uint8) for i in range(5)]
+        rewards = [1.0, 5.0, 3.0, 4.0, 2.0]
+        agent.buf = list(frames)
+        agent.buf_actions = self.mod.array('H', [0, 1, 2, 3, 4])
+        agent.buf_rewards = self.mod.array('f', rewards)
+        agent.buf_next_frames = [None] * 5
+        agent.buf_has_next = self.mod.array('b', [0, 0, 0, 0, 0])
+        agent.buf_priorities = self.mod.array('f', [agent._priority_from_reward(r) for r in rewards])
+        agent.buf_keys = [(f"k{i}", i) for i in range(5)]
+        agent.buf_hashes = self.mod.array('I', [100, 101, 102, 103, 104])
+        agent.buf_key_counts = {("stale", 1): 7}
+
+        agent._clear_replay(keep_frac=0.4)
+
+        self.assertEqual(list(agent.buf_hashes), [103, 101])
+        self.assertEqual(list(agent.buf_has_next), [0, 0])
+        self.assertEqual(agent.buf_key_counts, {("k3", 3): 1, ("k1", 1): 1})
 
     def test_add_replay_boosts_recent_predecessors_after_buffer_wrap(self):
         agent = self.make_agent()
@@ -3118,6 +4978,92 @@ class MyAgentUnitTests(unittest.TestCase):
         self.assertAlmostEqual(agent.buf_priorities[3], abs(rewards[3]) + 0.01, places=5)
         self.assertAlmostEqual(agent.buf_priorities[2], abs(rewards[2]) + 0.01, places=5)
         self.assertAlmostEqual(agent.buf_priorities[1], abs(rewards[1]) + 0.01, places=5)
+
+    def test_priority_from_reward_sanitizes_non_finite_values(self):
+        agent = self.make_agent()
+
+        self.assertAlmostEqual(agent._priority_from_reward(float("nan")), 0.01, places=5)
+        self.assertAlmostEqual(agent._priority_from_reward(float("inf")), 0.01, places=5)
+        self.assertAlmostEqual(agent._priority_from_reward(-2.5), 2.51, places=5)
+
+    def test_sampling_probabilities_falls_back_to_uniform_for_invalid_priorities(self):
+        agent = self.make_agent()
+        agent.buf_priorities = self.mod.array('f', [float("nan"), -3.0, 0.0, float("inf")])
+
+        probs = agent._sampling_probabilities(4)
+
+        self.assertTrue(np.all(np.isfinite(probs)))
+        self.assertTrue(np.allclose(probs, np.full(4, 0.25, dtype=np.float64)))
+
+    def test_sampling_probabilities_uses_positive_finite_entries(self):
+        agent = self.make_agent()
+        agent._per_alpha = 1.0
+        agent.buf_priorities = self.mod.array('f', [1.0, 2.0, 4.0])
+
+        probs = agent._sampling_probabilities(3)
+
+        self.assertTrue(np.all(np.isfinite(probs)))
+        self.assertTrue(np.allclose(probs, np.array([1.0, 2.0, 4.0], dtype=np.float64) / 7.0))
+
+    def test_update_sampled_priorities_preserves_last_duplicate_sample(self):
+        agent = self.make_agent()
+        agent.buf_priorities = self.mod.array('f', [1.0, 1.0, 1.0])
+
+        agent._update_sampled_priorities(
+            np.array([1, 2, 1], dtype=np.int64),
+            np.array([0.2, 0.4, 0.9], dtype=np.float32),
+        )
+
+        self.assertAlmostEqual(agent.buf_priorities[0], 1.0, places=5)
+        self.assertAlmostEqual(agent.buf_priorities[1], agent._priority_from_reward(0.9), places=5)
+        self.assertAlmostEqual(agent.buf_priorities[2], agent._priority_from_reward(0.4), places=5)
+
+    def test_update_sampled_priorities_sanitizes_non_finite_errors(self):
+        agent = self.make_agent()
+        agent.buf_priorities = self.mod.array('f', [1.0, 1.0, 1.0])
+
+        agent._update_sampled_priorities(
+            np.array([0, 1, 2], dtype=np.int64),
+            np.array([np.nan, np.inf, -0.5], dtype=np.float32),
+        )
+
+        self.assertAlmostEqual(agent.buf_priorities[0], 0.01, places=5)
+        self.assertAlmostEqual(agent.buf_priorities[1], 0.01, places=5)
+        self.assertAlmostEqual(agent.buf_priorities[2], 0.51, places=5)
+
+    def test_get_aem_tensors_uses_recent_tail_window(self):
+        agent = self.make_agent()
+        agent._aem_max_active = 3
+        for i in range(5):
+            agent._aem_diffs.append(np.full((64, 64), i, dtype=np.float32))
+            agent._aem_actions.append(i)
+            agent._aem_rewards.append(float(i) + 0.5)
+
+        diffs, acts, rews = agent._get_aem_tensors()
+
+        self.assertEqual(tuple(diffs.shape), (1, 3, 1, 64, 64))
+        self.assertEqual(tuple(acts.shape), (1, 3))
+        self.assertEqual(tuple(rews.shape), (1, 3))
+        self.assertTrue(np.allclose(diffs.cpu().numpy()[0, :, 0, 0, 0], np.array([2.0, 3.0, 4.0], dtype=np.float32)))
+        self.assertTrue(np.array_equal(acts.cpu().numpy()[0], np.array([2, 3, 4], dtype=np.int64)))
+        self.assertTrue(np.allclose(rews.cpu().numpy()[0], np.array([2.5, 3.5, 4.5], dtype=np.float32)))
+
+    def test_replay_numeric_views_cache_reuses_until_buffer_mutates(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+
+        agent._add_replay(frame, 1, 0.5)
+        first = agent._replay_numeric_views(1)
+        second = agent._replay_numeric_views(1)
+
+        self.assertIs(first, second)
+
+        del first
+        del second
+        agent._add_replay(frame, 2, 0.1)
+        third = agent._replay_numeric_views(2)
+
+        self.assertEqual(len(third[0]), 2)
 
     def test_direction_and_error_paths_return_fresh_action_instances(self):
         agent = self.make_agent()
@@ -3173,6 +5119,49 @@ class MyAgentUnitTests(unittest.TestCase):
 
         self.assertEqual(solver._action_key(2, None), (2,))
         self.assertEqual(solver._action_key(6, {"x": 5, "y": 9}), (6, 5, 9))
+
+    def test_bfs_priority_bonus_reuses_cached_click_lookup(self):
+        agent = self.make_agent()
+        calls = []
+
+        class FakeBfs:
+            def __init__(self):
+                self._action_priority = {(6, 5, 9): 2.0}
+
+            def _action_key(self, act_id, data):
+                calls.append((act_id, data))
+                return (act_id, None if not data else data.get("x"), None if not data else data.get("y"))
+
+        agent._bfs = FakeBfs()
+        payload = {"x": 5, "y": 9}
+
+        first = agent._bfs_priority_bonus(6, payload)
+        second = agent._bfs_priority_bonus(6, payload)
+
+        self.assertAlmostEqual(first, 0.5, places=5)
+        self.assertAlmostEqual(second, 0.5, places=5)
+        self.assertEqual(len(calls), 1)
+
+    def test_bfs_click_priority_bonus_reuses_cached_coord_lookup(self):
+        agent = self.make_agent()
+        calls = []
+
+        class FakeBfs:
+            def __init__(self):
+                self._action_priority = {(6, 5, 9): 2.0}
+
+            def _action_key(self, act_id, data):
+                calls.append((act_id, data))
+                return (act_id, None if not data else data.get("x"), None if not data else data.get("y"))
+
+        agent._bfs = FakeBfs()
+
+        first = agent._bfs_click_priority_bonus((9, 5))
+        second = agent._bfs_click_priority_bonus((9, 5))
+
+        self.assertAlmostEqual(first, 0.5, places=5)
+        self.assertAlmostEqual(second, 0.5, places=5)
+        self.assertEqual(len(calls), 1)
 
     def test_bfs_ordered_actions_prefers_higher_priority_then_action_id(self):
         solver = self.mod.BFSSolver("dummy.py", "DummyGame")
@@ -3250,10 +5239,204 @@ class MyAgentUnitTests(unittest.TestCase):
             np.zeros((64, 64), dtype=np.uint8),
             np.ones((64, 64), dtype=np.uint8),
         ]
+        agent.buf_hashes = self.mod.array(
+            'I',
+            [agent._fast_frame_hash(agent.buf[0]), agent._fast_frame_hash(agent.buf[1])],
+        )
 
         states = agent._replay_batch_tensor([0, 1])
 
         self.assertEqual(tuple(states.shape), (2, 26, 64, 64))
+
+    def test_encode_frame_tensor_normalizes_out_of_palette_values(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        frame[4, 5] = 99
+
+        tensor = agent._encode_frame_tensor(frame)
+
+        self.assertEqual(tuple(tensor.shape), (26, 64, 64))
+        self.assertTrue(np.isfinite(tensor.cpu().numpy()).all())
+        self.assertEqual(float(tensor[:16, 4, 5].sum().item()), 1.0)
+        self.assertEqual(float(tensor[0, 4, 5].item()), 1.0)
+
+    def test_replay_batch_tensor_normalizes_out_of_palette_values(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        frame[10, 11] = 42
+        agent.buf = [frame]
+        agent.buf_hashes = self.mod.array('I', [agent._fast_frame_hash(frame)])
+
+        states = agent._replay_batch_tensor([0])
+
+        self.assertEqual(tuple(states.shape), (1, 26, 64, 64))
+        self.assertTrue(np.isfinite(states.cpu().numpy()).all())
+        self.assertEqual(float(states[0, :16, 10, 11].sum().item()), 1.0)
+        self.assertEqual(float(states[0, 0, 10, 11].item()), 1.0)
+
+    def test_replay_batch_tensor_uses_cached_hashes_when_available(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        encoded = agent._encode_frame_tensor(frame)
+        frame_hash = agent._fast_frame_hash(frame)
+        agent.buf = [frame]
+        agent.buf_hashes = self.mod.array('I', [frame_hash])
+        agent._frame_feature_cache[frame_hash] = (
+            encoded[:16].unsqueeze(0),
+            encoded[16:17].unsqueeze(0),
+            encoded[17:18].unsqueeze(0),
+            encoded[18:19].unsqueeze(0),
+        )
+
+        with mock.patch.object(agent, "_fast_frame_hash", side_effect=AssertionError("should use cached replay hash")):
+            states = agent._replay_batch_tensor([0])
+
+        self.assertEqual(tuple(states.shape), (1, 26, 64, 64))
+
+    def test_replay_batch_tensor_reuses_positional_and_zero_tail_caches(self):
+        agent = self.make_agent()
+        frame0 = np.zeros((64, 64), dtype=np.uint8)
+        frame1 = np.ones((64, 64), dtype=np.uint8)
+        agent.buf = [frame0, frame1]
+        agent.buf_hashes = self.mod.array('I', [agent._fast_frame_hash(frame0), agent._fast_frame_hash(frame1)])
+
+        first = agent._replay_batch_tensor([0, 1])
+        pos_key = (first.device.type, first.device.index, 2)
+        zero_key = (first.device.type, first.device.index, 2, str(first.dtype))
+        tail_key = (first.device.type, first.device.index, 2, str(first.dtype))
+        first_pos = agent._replay_pos_cache[pos_key]
+        first_zero = agent._replay_zero_tail_cache[zero_key]
+        first_tail = agent._replay_tail_cache[tail_key]
+
+        second = agent._replay_batch_tensor([1, 0])
+        second_pos = agent._replay_pos_cache[pos_key]
+        second_zero = agent._replay_zero_tail_cache[zero_key]
+        second_tail = agent._replay_tail_cache[tail_key]
+
+        self.assertEqual(tuple(second.shape), (2, 26, 64, 64))
+        self.assertIs(first_pos, second_pos)
+        self.assertIs(first_zero, second_zero)
+        self.assertIs(first_tail, second_tail)
+
+    def test_replay_batch_tensor_stores_packed_feature_cache_entries(self):
+        import torch
+
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        frame_hash = agent._fast_frame_hash(frame)
+        agent.buf = [frame]
+        agent.buf_hashes = self.mod.array('I', [frame_hash])
+
+        states = agent._replay_batch_tensor([0])
+        cached = agent._frame_feature_cache[frame_hash]
+
+        self.assertEqual(tuple(states.shape), (1, 26, 64, 64))
+        self.assertTrue(torch.is_tensor(cached))
+        self.assertEqual(tuple(cached.shape), (1, 19, 64, 64))
+
+    def test_replay_batch_tensor_reuses_packed_features_for_duplicate_hashes_in_batch(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        frame_hash = agent._fast_frame_hash(frame)
+        agent.buf = [frame, frame.copy()]
+        agent.buf_hashes = self.mod.array('I', [frame_hash, frame_hash])
+
+        pack_calls = {"count": 0}
+        original_pack = agent._pack_replay_feature_channels
+
+        def counting_pack(*args, **kwargs):
+            pack_calls["count"] += 1
+            return original_pack(*args, **kwargs)
+
+        agent._pack_replay_feature_channels = counting_pack
+        try:
+            states = agent._replay_batch_tensor([0, 1])
+        finally:
+            agent._pack_replay_feature_channels = original_pack
+
+        self.assertEqual(tuple(states.shape), (2, 26, 64, 64))
+        self.assertEqual(pack_calls["count"], 1)
+
+    def test_replay_batch_tensor_upgrades_legacy_cache_entries_to_packed_tensors(self):
+        import torch
+
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        encoded = agent._encode_frame_tensor(frame)
+        frame_hash = agent._fast_frame_hash(frame)
+        agent.buf = [frame]
+        agent.buf_hashes = self.mod.array('I', [frame_hash])
+        agent._frame_feature_cache[frame_hash] = (
+            encoded[:16].unsqueeze(0),
+            encoded[16:17].unsqueeze(0),
+            encoded[17:18].unsqueeze(0),
+            encoded[18:19].unsqueeze(0),
+        )
+
+        states = agent._replay_batch_tensor([0])
+        upgraded = agent._frame_feature_cache[frame_hash]
+
+        self.assertEqual(tuple(states.shape), (1, 26, 64, 64))
+        self.assertTrue(torch.is_tensor(upgraded))
+        self.assertEqual(tuple(upgraded.shape), (1, 19, 64, 64))
+
+    def test_sample_uses_supplied_avail_ids_without_recomputing(self):
+        import torch
+
+        agent = self.make_agent()
+        logits = torch.tensor([0.1, 3.0, 0.2, 0.0, -1.0], dtype=torch.float32, device=agent.device)
+
+        with mock.patch.object(agent, "_available_action_ids", side_effect=AssertionError("should use provided avail_ids")):
+            action_idx, coords = agent._sample(
+                logits,
+                avail=[_GameAction.ACTION2],
+                avail_ids=[2],
+                temp=1.0,
+            )
+
+        self.assertEqual(action_idx, 1)
+        self.assertIsNone(coords)
+
+    def test_train_handles_next_frame_sampling_with_ndarray_indices(self):
+        import torch
+
+        agent = self.make_agent()
+        agent.bsz = 2
+        frame0 = np.zeros((64, 64), dtype=np.uint8)
+        frame1 = np.ones((64, 64), dtype=np.uint8)
+        next_frame = np.full((64, 64), 2, dtype=np.uint8)
+        agent.buf = [frame0, frame1]
+        agent.buf_actions = self.mod.array('H', [0, 1])
+        agent.buf_rewards = self.mod.array('f', [1.0, 0.5])
+        agent.buf_next_frames = [next_frame, None]
+        agent.buf_has_next = self.mod.array('b', [1, 0])
+        agent.buf_priorities = self.mod.array('f', [1.0, 1.0])
+        agent.buf_hashes = self.mod.array('I', [agent._fast_frame_hash(frame0), agent._fast_frame_hash(frame1)])
+
+        class TinyTrainNet(torch.nn.Module):
+            def __init__(self, device):
+                super().__init__()
+                self.logits = torch.nn.Parameter(torch.tensor([0.2, 0.1, -0.1, -0.2, -0.3], dtype=torch.float32, device=device))
+
+            def forward(self, x, *args, **kwargs):
+                return self.logits.unsqueeze(0).expand(x.size(0), -1)
+
+            def forward_actions(self, x, *args, **kwargs):
+                return self.forward(x)
+
+        agent.net = TinyTrainNet(agent.device)
+        agent._target_net = TinyTrainNet(agent.device)
+        agent._target_net.load_state_dict(agent.net.state_dict())
+        agent.opt = torch.optim.SGD(agent.net.parameters(), lr=0.01)
+        agent.scheduler = None
+        agent._replay_batch_tensor = lambda indices: torch.zeros((len(indices), 26, 64, 64), dtype=torch.float32, device=agent.device)
+
+        with mock.patch.object(self.mod.np.random, "choice", return_value=np.array([0, 1], dtype=np.int64)):
+            trained = agent._train()
+
+        self.assertTrue(trained)
+        self.assertEqual(agent._model_revision, 1)
+        self.assertTrue(all(np.isfinite(priority) and priority > 0.0 for priority in agent.buf_priorities))
 
     def test_frame_view_casts_dtype_without_changing_values(self):
         frame = np.arange(16, dtype=np.uint8).reshape(4, 4)
