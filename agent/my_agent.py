@@ -32,6 +32,7 @@
 #         preserving learned exploration for CNN fallback.
 # =====================================================================
 import copy
+from concurrent.futures import ThreadPoolExecutor
 import gc
 import math
 import pickle
@@ -203,6 +204,17 @@ class _ImplicitSearchGraph:
         path.reverse()
         return path
 
+
+class _BranchEvalResult:
+    __slots__ = ("act_id", "data", "child", "solved", "state_key")
+
+    def __init__(self, act_id, data, child, solved, state_key=None):
+        self.act_id = int(act_id)
+        self.data = data
+        self.child = child
+        self.solved = bool(solved)
+        self.state_key = state_key
+
 # ==================== BFS SOLVER ====================
 class BFSSolver:
     """Offline BFS solver using direct game class instantiation."""
@@ -254,6 +266,10 @@ class BFSSolver:
         self._snapshot_protocol = pickle.HIGHEST_PROTOCOL
         # Pick best safe branch strategy at runtime.
         self._snapshot_branch_mode = 'restore_each'
+        self._parallel_workers = max(1, min(4, os.cpu_count() or 1))
+        self._parallel_min_branching = 4
+        self._parallel_click_chunk = 8
+        self._parallel_pool = None
 
     def load(self):
         """Load the game class from source."""
@@ -768,66 +784,207 @@ class BFSSolver:
 
         return ordered
 
+    def _map_ordered(self, worker, items):
+        """Run a pure worker over ordered items, optionally with threads."""
+        if len(items) < 2 or self._parallel_workers <= 1:
+            return [worker(*item) for item in items]
+        executor = self._parallel_pool
+        if executor is not None:
+            futures = [executor.submit(worker, *item) for item in items]
+            return [future.result() for future in futures]
+        max_workers = min(self._parallel_workers, len(items))
+        with ThreadPoolExecutor(max_workers=max_workers) as local_executor:
+            futures = [local_executor.submit(worker, *item) for item in items]
+            return [future.result() for future in futures]
+
+    def _ensure_parallel_pool(self):
+        """Create one reusable executor for a solve attempt."""
+        if self._parallel_workers <= 1 or self._parallel_pool is not None:
+            return
+        self._parallel_pool = ThreadPoolExecutor(max_workers=self._parallel_workers)
+
+    def _close_parallel_pool(self):
+        pool = self._parallel_pool
+        self._parallel_pool = None
+        if pool is not None:
+            pool.shutdown(wait=True)
+
+    def _scan_direction_action(self, game, f0, act_id):
+        """Probe one directional/interact action and report its visible delta."""
+        g = self._clone_game(game)
+        try:
+            r = g.perform_action(self._make_action(act_id), raw=True)
+        except Exception:
+            return None
+        f = self._last_frame(r)
+        if f is None:
+            return None
+        delta = int(np.count_nonzero(f0 != f))
+        if not delta:
+            return None
+        return int(act_id), None, delta
+
+    def _scan_click_candidate(self, game, f0, x, y):
+        """Probe one ACTION6 candidate and report its effect hash and delta."""
+        g = self._clone_game(game)
+        click_data = {'x': int(x), 'y': int(y), 'game_id': 'bfs'}
+        try:
+            r = g.perform_action(self._make_action(6, click_data), raw=True)
+        except Exception:
+            return None
+        f = self._last_frame(r)
+        if f is None:
+            return None
+        delta = int(np.count_nonzero(f0 != f))
+        if not delta:
+            return None
+        return 6, click_data, delta, _frame_crc(f)
+
+    def _evaluate_branch(self, game, act_id, data, level_idx, depth, hidden_fields):
+        """Evaluate one BFS branch without mutating shared search state."""
+        child = self._clone_game(game)
+        try:
+            r = child.perform_action(self._make_action(act_id, data), raw=True)
+        except Exception:
+            return None
+        if self._is_complete(child, r, level_idx):
+            return _BranchEvalResult(int(act_id), data, child, True)
+        f = self._last_frame(r)
+        if f is None or depth >= self.max_bfs_depth:
+            return _BranchEvalResult(int(act_id), data, child, False)
+        return _BranchEvalResult(
+            int(act_id),
+            data,
+            child,
+            False,
+            state_key=self._state_hash(child, f, hidden_fields),
+        )
+
+    def _evaluate_branch_candidates(self, game, candidates, level_idx, depth, hidden_fields):
+        """Return ordered branch-evaluation results for one frontier node."""
+        if not candidates:
+            return []
+        items = [
+            (game, act_id, data, level_idx, depth, hidden_fields)
+            for act_id, data in candidates
+        ]
+        if len(candidates) >= self._parallel_min_branching and self._parallel_workers > 1:
+            return self._map_ordered(self._evaluate_branch, items)
+        return [self._evaluate_branch(*item) for item in items]
+
+    def _run_clone_bfs_pass(self, graph, queue, visited, actions, level_idx, max_states,
+                            timeout_s, hidden_fields, beam_transition, beam_k, frontier_cap,
+                            trim_label, solved_log_template):
+        """Run one clone-based BFS pass with coordinator-owned shared state."""
+        t0 = time.time()
+        explored = 0
+        while queue and explored < max_states and (time.time() - t0) < timeout_s:
+            node_idx = queue.popleft()
+            g = graph.take_state(node_idx)
+            if g is None:
+                continue
+            depth = graph.get_depth(node_idx)
+            last_act = graph.get_last_action(node_idx) or None
+            use_beam = explored > beam_transition
+            action_slice = actions[:beam_k] if use_beam else actions
+            remaining_budget = max_states - explored
+            branch_candidates = []
+            for act_id, data in action_slice:
+                if last_act is not None and self._opposite_actions.get(last_act) == act_id:
+                    continue
+                branch_candidates.append((act_id, data))
+                if len(branch_candidates) >= remaining_budget:
+                    break
+            for branch in self._evaluate_branch_candidates(
+                    g, branch_candidates, level_idx, depth, hidden_fields):
+                if branch is None:
+                    continue
+                explored += 1
+                if branch.solved:
+                    child_idx = graph.add_child(node_idx, branch.act_id, branch.data, None)
+                    new_hist = self._reconstruct_solution(graph, child_idx)
+                    elapsed = time.time() - t0
+                    logger.info(solved_log_template.format(
+                        level_idx=level_idx,
+                        actions=len(new_hist),
+                        explored=explored,
+                        elapsed=elapsed,
+                    ))
+                    self.solutions[level_idx] = new_hist
+                    return new_hist, explored, elapsed
+                if branch.state_key is None or branch.state_key in visited:
+                    continue
+                visited.add(branch.state_key)
+                child_idx = graph.add_child(node_idx, branch.act_id, branch.data, branch.child)
+                queue.append(child_idx)
+                if len(queue) > frontier_cap * 2:
+                    self._trim_frontier_if_needed(queue, graph, frontier_cap, trim_label)
+        return None, explored, time.time() - t0
+
     def _scan_actions(self, game, f0, bg):
         """Scan effective actions and record a cheap static effect priority."""
         avail = game._available_actions
-        clone_game = self._clone_game
         actions = []
         self._action_priority = {}
         # Directional/interact actions
-        for a in [a for a in avail if a <= 5]:
-            g = clone_game(game)
-            try:
-                r = g.perform_action(self._make_action(a), raw=True)
-                f = self._last_frame(r)
-                if f is not None:
-                    delta = int(np.count_nonzero(f0 != f))
-                    if delta:
-                        actions.append((a, None))
-                        self._action_priority[self._action_key(a, None)] = delta
-            except:
-                pass
+        direction_ids = [int(a) for a in avail if a <= 5]
+        direction_items = [(game, f0, a) for a in direction_ids]
+        direction_results = self._map_ordered(self._scan_direction_action, direction_items)
+        for result in direction_results:
+            if result is None:
+                continue
+            act_id, data, delta = result
+            actions.append((act_id, data))
+            self._action_priority[self._action_key(act_id, data)] = delta
         # Click actions: prioritised candidate list instead of brute 32x32 scan.
         if 6 in avail:
             t0 = time.time()
             seen_effects = set()
             candidates = self._click_candidates(f0, bg, max_candidates=80)
             tested = 0
+            click_chunk = []
             for x, y in candidates:
                 if time.time() - t0 > self.scan_timeout:
                     break
-                # Prefer non-background candidates, but keep coarse fallback clicks.
                 if f0[y, x] == bg and tested < 96:
                     continue
                 tested += 1
-                g = clone_game(game)
-                try:
-                    r = g.perform_action(
-                        self._make_action(6, {'x': x, 'y': y, 'game_id': 'bfs'}),
-                        raw=True
-                    )
-                    f = self._last_frame(r)
-                    if f is None:
+                click_chunk.append((game, f0, x, y))
+                if len(click_chunk) < self._parallel_click_chunk:
+                    continue
+                for result in self._map_ordered(self._scan_click_candidate, click_chunk):
+                    if result is None:
                         continue
-                    delta = int(np.count_nonzero(f0 != f))
-                    if delta:
-                        effect_hash = _frame_crc(f)
-                        if effect_hash not in seen_effects:
-                            seen_effects.add(effect_hash)
-                            click_data = {'x': x, 'y': y, 'game_id': 'bfs'}
-                            actions.append((6, click_data))
-                            self._action_priority[self._action_key(6, click_data)] = delta
-                except:
-                    pass
+                    act_id, click_data, delta, effect_hash = result
+                    if effect_hash in seen_effects:
+                        continue
+                    seen_effects.add(effect_hash)
+                    actions.append((act_id, click_data))
+                    self._action_priority[self._action_key(act_id, click_data)] = delta
+                click_chunk = []
+            if click_chunk:
+                for result in self._map_ordered(self._scan_click_candidate, click_chunk):
+                    if result is None:
+                        continue
+                    act_id, click_data, delta, effect_hash = result
+                    if effect_hash in seen_effects:
+                        continue
+                    seen_effects.add(effect_hash)
+                    actions.append((act_id, click_data))
+                    self._action_priority[self._action_key(act_id, click_data)] = delta
         return actions
 
     def solve_level(self, level_idx, max_states=150000, prev_solution=None, timeout=None,
                      net=None, frame_tensor=None):
         """Run the allocation-heavy search with cyclic-GC paused."""
-        with _paused_bfs_gc():
-            return self._solve_level_impl(level_idx, max_states=max_states,
-                                          prev_solution=prev_solution, timeout=timeout,
-                                          net=net, frame_tensor=frame_tensor)
+        self._ensure_parallel_pool()
+        try:
+            with _paused_bfs_gc():
+                return self._solve_level_impl(level_idx, max_states=max_states,
+                                              prev_solution=prev_solution, timeout=timeout,
+                                              net=net, frame_tensor=frame_tensor)
+        finally:
+            self._close_parallel_pool()
 
     def _solve_level_impl(self, level_idx, max_states=500000, prev_solution=None, timeout=None,
                           net=None, frame_tensor=None):
@@ -944,57 +1101,23 @@ class BFSSolver:
         beam_transition = 800  # after this many explored states, restrict to top-K
         beam_K = 2
 
-        while queue and explored < max_states and (time.time() - t0) < effective_timeout:
-            node_idx = queue.popleft()
-            g = graph.take_state(node_idx)
-            if g is None:
-                continue
-            depth = graph.get_depth(node_idx)
-            last_act = graph.get_last_action(node_idx) or None
-            # Full expansion near the root; beam search deeper
-            use_beam = explored > beam_transition
-            candidates = actions[:beam_K] if use_beam else actions
-
-            for act_id, data in candidates:
-                # Partial-order reduction: immediate inverse directions cannot
-                # improve a shortest path when the prior state is already visited.
-                if last_act is not None and self._opposite_actions.get(last_act) == act_id:
-                    continue
-                child = clone_game(g)
-                try:
-                    r = child.perform_action(make_action(act_id, data), raw=True)
-                except Exception:
-                    continue
-                explored += 1
-
-                # A winning edge does not need a frame conversion or a visited-set
-                # lookup.  This is especially useful at the depth limit.
-                if is_complete(child, r, level_idx):
-                    child_idx = graph.add_child(node_idx, act_id, data, None)
-                    new_hist = self._reconstruct_solution(graph, child_idx)
-                    elapsed = time.time() - t0
-                    logger.info(f"BFS L{level_idx}: SOLVED in {len(new_hist)} actions ({explored} explored, {elapsed:.1f}s)")
-                    self.solutions[level_idx] = new_hist
-                    return new_hist
-
-                f = last_frame(r)
-                is_new_state = (f is not None and depth < self.max_bfs_depth)
-                if is_new_state:
-                    h = state_hash(child, f, hidden_fields)
-                    is_new_state = h not in visited
-                    if is_new_state:
-                        visited.add(h)
-
-                if is_new_state:
-                    g2 = clone_game(child)
-                    child_idx = graph.add_child(node_idx, act_id, data, g2)
-                    queue.append(child_idx)
-                    if len(queue) > self.max_bfs_queue * 2:
-                        self._trim_frontier_if_needed(queue, graph, self.max_bfs_queue, f"L{level_idx}")
-
-                # child is discarded by GC after this iteration
-
-        elapsed_first = time.time() - t0
+        first_solution, explored, elapsed_first = self._run_clone_bfs_pass(
+            graph,
+            queue,
+            visited,
+            actions,
+            level_idx,
+            max_states,
+            effective_timeout,
+            hidden_fields,
+            beam_transition,
+            beam_K,
+            self.max_bfs_queue,
+            f"L{level_idx}",
+            "BFS L{level_idx}: SOLVED in {actions} actions ({explored} explored, {elapsed:.1f}s)",
+        )
+        if first_solution:
+            return first_solution
         logger.info(f"BFS L{level_idx}: first pass timeout ({explored} explored, {len(visited)} unique, {elapsed_first:.1f}s)")
         self._last_effective_actions = list(actions)
 
@@ -1036,53 +1159,25 @@ class BFSSolver:
                 graph2 = self._graph_cls(clone_game(game2))
                 queue2.append(0)
 
-                t0_2 = time.time()
-                explored2 = 0
                 # Keep retry bounded.  It is a fallback, not a second full BFS.
                 remaining = min(self.hidden_retry_time_cap, max(0.0, effective_timeout - elapsed_first))
-
-                while queue2 and explored2 < max_states and (time.time() - t0_2) < remaining:
-                    node_idx = queue2.popleft()
-                    g = graph2.take_state(node_idx)
-                    if g is None:
-                        continue
-                    depth = graph2.get_depth(node_idx)
-                    last_act = graph2.get_last_action(node_idx) or None
-                    use_beam2 = explored2 > beam_transition
-                    candidates2 = actions[:beam_K] if use_beam2 else actions
-
-                    for act_id, data in candidates2:
-                        if last_act is not None and self._opposite_actions.get(last_act) == act_id:
-                            continue
-                        child = clone_game(g)
-                        try:
-                            r = child.perform_action(make_action(act_id, data), raw=True)
-                        except Exception:
-                            continue
-                        explored2 += 1
-
-                        if is_complete(child, r, level_idx):
-                            child_idx = graph2.add_child(node_idx, act_id, data, None)
-                            new_hist = self._reconstruct_solution(graph2, child_idx)
-                            logger.info(f"BFS L{level_idx}: SOLVED (hidden retry) in {len(new_hist)} actions ({explored2} explored)")
-                            self.solutions[level_idx] = new_hist
-                            return new_hist
-
-                        f = last_frame(r)
-                        is_new_state = (f is not None and depth < self.max_bfs_depth)
-                        if is_new_state:
-                            h = state_hash(child, f, hidden_fields)
-                            is_new_state = h not in visited2
-                            if is_new_state:
-                                visited2.add(h)
-
-                        if is_new_state:
-                            g2 = clone_game(child)
-                            child_idx = graph2.add_child(node_idx, act_id, data, g2)
-                            queue2.append(child_idx)
-                            if len(queue2) > self.max_bfs_queue_retry * 2:
-                                self._trim_frontier_if_needed(queue2, graph2, self.max_bfs_queue_retry, f"L{level_idx} hidden-retry")
-
+                retry_solution, explored2, _ = self._run_clone_bfs_pass(
+                    graph2,
+                    queue2,
+                    visited2,
+                    actions,
+                    level_idx,
+                    max_states,
+                    remaining,
+                    hidden_fields,
+                    beam_transition,
+                    beam_K,
+                    self.max_bfs_queue_retry,
+                    f"L{level_idx} hidden-retry",
+                    "BFS L{level_idx}: SOLVED (hidden retry) in {actions} actions ({explored} explored)",
+                )
+                if retry_solution:
+                    return retry_solution
                 logger.info(f"BFS L{level_idx}: hidden retry also failed ({explored2} explored, {len(visited2)} unique)")
 
         return None
@@ -1420,6 +1515,8 @@ class MyAgent(Agent):
         s._semantic_components_cache_value=None
         s._semantic_detector_grid_cache_key=None
         s._semantic_detector_grid_cache_value=None
+        s._recent_direction_progress_cache_key=None
+        s._recent_direction_progress_cache_value=None
         s._semantic_target_candidates_cache_key=None
         s._semantic_target_candidates_cache_value=None
         s._semantic_click_targets_cache_key=None
@@ -1428,6 +1525,8 @@ class MyAgent(Agent):
         s._semantic_click_candidate_indices_cache_value=None
         s._heuristic_click_fallback_cache_key=None
         s._heuristic_click_fallback_cache_value=None
+        s._click_frontier_available_cache_key=None
+        s._click_frontier_available_cache_value=None
         # TD-learning hyperparameters
         s.gamma = 0.9; s.tau = 0.005; s._target_net = None
         s._mdqn_alpha = 0.9; s._mdqn_tau = 0.03
@@ -1844,6 +1943,40 @@ class MyAgent(Agent):
             s._frame_matches_previous(frame)
         )
 
+    def _has_click_frontier(s, frame, blocked_click_coord=None, frame_hash=None):
+        """Return whether any semantic or fallback click frontier is currently available."""
+        if frame_hash is None:
+            frame_hash=s._fast_frame_hash(frame)
+        cache_key=(
+            frame_hash,
+            None if blocked_click_coord is None else (int(blocked_click_coord[0]), int(blocked_click_coord[1])),
+            s._blocked_click_history_signature(),
+            None if s._semantic_target_coord is None else (
+                int(s._semantic_target_coord[0]),
+                int(s._semantic_target_coord[1]),
+            ),
+            round(float(s._semantic_continuity_scale()), 3),
+        )
+        if s._click_frontier_available_cache_key == cache_key:
+            return s._click_frontier_available_cache_value
+        semantic_clicks=s._semantic_click_targets_compat(
+            frame,
+            limit=1,
+            blocked_click_coord=blocked_click_coord,
+            frame_hash=frame_hash,
+        )
+        has_frontier=bool(semantic_clicks)
+        if not has_frontier:
+            fallback_clicks=s._heuristic_click_fallback_targets(
+                frame,
+                blocked_click_coord=blocked_click_coord,
+                frame_hash=frame_hash,
+            )
+            has_frontier=bool(fallback_clicks)
+        s._click_frontier_available_cache_key=cache_key
+        s._click_frontier_available_cache_value=has_frontier
+        return has_frontier
+
     def _wait_recovery_bonus(s, frame, avail_ids, blocked_click_coord=None, frame_hash=None,
                              avail_summary=None):
         """Prefer ACTION5 when the agent is stuck and all semantic frontiers are exhausted."""
@@ -1859,22 +1992,12 @@ class MyAgent(Agent):
                     frame_hash=frame_hash,
                     blocked_direction=blocked_direction):
                 return 0.0
-        if avail_summary["has_click"]:
-            semantic_clicks=s._semantic_click_targets_compat(
-                frame,
-                limit=2,
-                blocked_click_coord=blocked_click_coord,
-                frame_hash=frame_hash,
-            )
-            if semantic_clicks:
-                return 0.0
-            fallback_clicks=s._heuristic_click_fallback_targets(
-                frame,
-                blocked_click_coord=blocked_click_coord,
-                frame_hash=frame_hash,
-            )
-            if fallback_clicks:
-                return 0.0
+        if (avail_summary["has_click"] and
+                s._has_click_frontier(
+                    frame,
+                    blocked_click_coord=blocked_click_coord,
+                    frame_hash=frame_hash)):
+            return 0.0
         return 0.3
 
     def _modeled_frontier_exhausted(s, frame, avail_ids, blocked_click_coord=None, frame_hash=None,
@@ -1894,22 +2017,11 @@ class MyAgent(Agent):
                 return False
         if not avail_summary["has_click"]:
             return True
-        semantic_clicks=s._semantic_click_targets_compat(
-            frame,
-            limit=1,
-            blocked_click_coord=blocked_click_coord,
-            frame_hash=frame_hash,
-        )
-        if semantic_clicks:
-            return False
-        fallback_clicks=s._heuristic_click_fallback_targets(
+        return not s._has_click_frontier(
             frame,
             blocked_click_coord=blocked_click_coord,
             frame_hash=frame_hash,
         )
-        if fallback_clicks:
-            return False
-        return True
 
     def _retry_blocked_direction_after_stale_wait(s, frame, avail_ids, blocked_click_coord=None, frame_hash=None,
                                                   avail_summary=None):
@@ -1928,22 +2040,12 @@ class MyAgent(Agent):
                 frame_hash=frame_hash,
                 blocked_direction=blocked_direction) for aid in legal_dirs):
             return False
-        if avail_summary["has_click"]:
-            semantic_clicks=s._semantic_click_targets_compat(
-                frame,
-                limit=1,
-                blocked_click_coord=blocked_click_coord,
-                frame_hash=frame_hash,
-            )
-            if semantic_clicks:
-                return False
-            fallback_clicks=s._heuristic_click_fallback_targets(
-                frame,
-                blocked_click_coord=blocked_click_coord,
-                frame_hash=frame_hash,
-            )
-            if fallback_clicks:
-                return False
+        if (avail_summary["has_click"] and
+                s._has_click_frontier(
+                    frame,
+                    blocked_click_coord=blocked_click_coord,
+                    frame_hash=frame_hash)):
+            return False
         return True
 
     def _should_exit_warmup_early(s, frame, avail_ids, blocked_click_coord=None, frame_hash=None,
@@ -2000,6 +2102,21 @@ class MyAgent(Agent):
 
     def _recent_direction_progress_delta(s, frame, blocked_click_coord=None, frame_hash=None):
         """Return semantic target-distance improvement from the last effective direction."""
+        if frame_hash is None:
+            frame_hash=s._fast_frame_hash(frame)
+        prev_frame_hash=s.ph if s.ph is not None else (
+            s._fast_frame_hash(s.pr) if s.pr is not None else None
+        )
+        cache_key=(
+            frame_hash,
+            prev_frame_hash,
+            None if blocked_click_coord is None else (int(blocked_click_coord[0]), int(blocked_click_coord[1])),
+            s._blocked_click_history_signature(),
+            s._recent_direction_action_index(frame, frame_hash=frame_hash),
+        )
+        if s._recent_direction_progress_cache_key == cache_key:
+            return s._recent_direction_progress_cache_value
+
         def _baseline_goal_distance(goal_frame, goal_blocked_click_coord=None, goal_frame_hash=None):
             comps=s._semantic_components(goal_frame, frame_hash=goal_frame_hash)
             if not comps:
@@ -2047,11 +2164,14 @@ class MyAgent(Agent):
             return best[1]
 
         if s.pr is None:
+            s._recent_direction_progress_cache_key=cache_key
+            s._recent_direction_progress_cache_value=None
             return None
-        recent_direction=s._recent_direction_action_index(frame, frame_hash=frame_hash)
+        recent_direction=cache_key[-1]
         if recent_direction is None:
+            s._recent_direction_progress_cache_key=cache_key
+            s._recent_direction_progress_cache_value=None
             return None
-        prev_frame_hash=s.ph if s.ph is not None else s._fast_frame_hash(s.pr)
         prev_dist=_baseline_goal_distance(s.pr, goal_frame_hash=prev_frame_hash)
         curr_dist=_baseline_goal_distance(
             frame,
@@ -2059,8 +2179,13 @@ class MyAgent(Agent):
             goal_frame_hash=frame_hash,
         )
         if prev_dist is None or curr_dist is None:
+            s._recent_direction_progress_cache_key=cache_key
+            s._recent_direction_progress_cache_value=None
             return None
-        return float(prev_dist - curr_dist)
+        progress_delta=float(prev_dist - curr_dist)
+        s._recent_direction_progress_cache_key=cache_key
+        s._recent_direction_progress_cache_value=progress_delta
+        return progress_delta
 
     def _semantic_direct_click_choice(s, frame, avail=None, avail_ids=None,
                                       blocked_click_coord=None, frame_hash=None):
@@ -2365,8 +2490,9 @@ class MyAgent(Agent):
         """Choose the next modeled action from heuristic, exploration, or CNN rescoring."""
         a6_avail=6 in avail_ids
         avail_summary=s._availability_summary(avail_ids)
+        selected_target_choice=None
         if s.net is None:
-            return s._heuristic(
+            aidx,coords=s._heuristic(
                 raw,
                 avail,
                 s.la,
@@ -2375,16 +2501,31 @@ class MyAgent(Agent):
                 frame_hash=frame_hash,
                 avail_summary=avail_summary,
             )
-        direct_click_choice=s._semantic_direct_click_choice(
-            raw,
-            avail,
-            avail_ids=avail_ids,
-            blocked_click_coord=blocked_click_coord,
-            frame_hash=frame_hash,
-        )
-        if direct_click_choice is not None:
-            return direct_click_choice
+            return aidx,coords,selected_target_choice
+        if a6_avail:
+            direct_click_choice=s._semantic_direct_click_choice(
+                raw,
+                avail,
+                avail_ids=avail_ids,
+                blocked_click_coord=blocked_click_coord,
+                frame_hash=frame_hash,
+            )
+            if direct_click_choice is not None:
+                aidx,coords=direct_click_choice
+                return aidx,coords,selected_target_choice
         if random.random() < s._eps:
+            exploration_action=s._sample_semantic_exploration_sparse(
+                raw,
+                avail,
+                blocked_click_coord=blocked_click_coord,
+                avail_ids=avail_ids,
+                frame_hash=frame_hash,
+                avail_summary=avail_summary,
+                temp=1.25,
+            )
+            if exploration_action is not None:
+                aidx,coords=exploration_action
+                return aidx,coords,selected_target_choice
             prior_logits=s._semantic_exploration_logits(
                 raw,
                 avail,
@@ -2394,7 +2535,7 @@ class MyAgent(Agent):
                 frame_hash=frame_hash,
                 avail_summary=avail_summary,
             )
-            return s._sample_semantic_exploration(
+            aidx,coords=s._sample_semantic_exploration(
                 prior_logits,
                 raw,
                 avail,
@@ -2403,6 +2544,7 @@ class MyAgent(Agent):
                 frame_hash=frame_hash,
                 temp=1.25,
             )
+            return aidx,coords,selected_target_choice
         with torch.inference_mode():
             with s._amp_context():
                 net_input=tensor.unsqueeze(0)
@@ -2423,26 +2565,17 @@ class MyAgent(Agent):
         aidx,coords=None,None
         try:
             K=5
-            avail_mask=s._legal_action_mask(logits, avail, avail_ids=avail_ids)
             semantic_click_targets=[]
             semantic_click_bonus_map={}
             semantic_dirs=s._semantic_direction_bonuses(raw, avail, avail_ids=avail_ids, frame_hash=frame_hash)
             blocked_direction_idx=s._blocked_direction_action_index(raw, frame_hash=frame_hash)
             repeat_direction_bonus_idx=s._recent_direction_action_index(raw, frame_hash=frame_hash)
-            repeat_click_bonus_idx=s._recent_click_action_index(raw, frame_hash=frame_hash)
-            preferred_click_coord=s._preferred_click_coord()
-            prefer_continuity_click=s._preferred_click_continuity_active()
-            target_choice=s._semantic_target_choice(
-                raw,
-                blocked_click_coord=blocked_click_coord,
-                frame_hash=frame_hash,
-            )
-            click_scale=s._semantic_click_bonus_scale(
-                raw,
-                blocked_click_coord=blocked_click_coord,
-                frame_hash=frame_hash,
-                target_choice=target_choice,
-            )
+            repeat_click_bonus_idx=None
+            preferred_click_coord=None
+            prefer_continuity_click=False
+            continuity_scale=0.0
+            target_choice=None
+            click_scale=1.0
             retry_blocked_direction=s._retry_blocked_direction_after_stale_wait(
                 raw,
                 avail_ids,
@@ -2450,8 +2583,32 @@ class MyAgent(Agent):
                 frame_hash=frame_hash,
                 avail_summary=avail_summary,
             )
-            blocked_click_idx=s._blocked_click_action_index(raw, frame_hash=frame_hash)
+            wait_recovery_bonus=s._wait_recovery_bonus(
+                raw,
+                avail_ids,
+                blocked_click_coord=blocked_click_coord,
+                frame_hash=frame_hash,
+                avail_summary=avail_summary,
+            )
+            blocked_click_idx=None
             if a6_avail:
+                preferred_click_coord=s._preferred_click_coord()
+                continuity_scale=s._semantic_continuity_scale()
+                prefer_continuity_click=(preferred_click_coord is not None and continuity_scale > 0.5)
+                repeat_click_bonus_idx=s._recent_click_action_index(raw, frame_hash=frame_hash)
+                target_choice=s._semantic_target_choice(
+                    raw,
+                    blocked_click_coord=blocked_click_coord,
+                    frame_hash=frame_hash,
+                )
+                selected_target_choice=target_choice
+                click_scale=s._semantic_click_bonus_scale(
+                    raw,
+                    blocked_click_coord=blocked_click_coord,
+                    frame_hash=frame_hash,
+                    target_choice=target_choice,
+                )
+                blocked_click_idx=s._blocked_click_action_index(raw, frame_hash=frame_hash)
                 semantic_click_targets=s._semantic_click_targets_compat(
                     raw,
                     limit=6,
@@ -2464,13 +2621,24 @@ class MyAgent(Agent):
                     click_scale=click_scale,
                     click_targets=semantic_click_targets,
                 )
-            n_valid=s._legal_modeled_action_count(len(logits), avail_ids)
-            if n_valid > 0:
-                scored=logits + avail_mask
-                best_k=scored.topk(min(K, n_valid))
+            sparse_click_candidate_indices=()
+            if a6_avail:
+                sparse_click_candidate_indices=s._semantic_click_candidate_indices(
+                    raw,
+                    click_targets=semantic_click_targets,
+                    blocked_click_coord=blocked_click_coord,
+                    frame_hash=frame_hash,
+                )
+            best_k_indices=s._top_legal_policy_indices(
+                logits,
+                avail_ids,
+                K,
+                click_candidate_indices=sparse_click_candidate_indices,
+            )
+            if best_k_indices:
                 candidate_indices=[]
                 candidate_seen=set()
-                for idx in best_k.indices.tolist():
+                for idx in best_k_indices:
                     s._append_candidate_index(candidate_indices, candidate_seen, idx)
                 for idx in s._semantic_candidate_action_indices(
                         raw,
@@ -2478,9 +2646,11 @@ class MyAgent(Agent):
                         avail,
                         direction_bonuses=semantic_dirs,
                         click_targets=semantic_click_targets,
+                        click_candidate_indices=sparse_click_candidate_indices,
                         blocked_click_coord=blocked_click_coord,
                         avail_ids=avail_ids,
-                        frame_hash=frame_hash):
+                        frame_hash=frame_hash,
+                        wait_recovery_bonus=wait_recovery_bonus):
                     s._append_candidate_index(
                         candidate_indices,
                         candidate_seen,
@@ -2499,63 +2669,55 @@ class MyAgent(Agent):
                         candidate_seen,
                         preferred_click_idx,
                     )
-                candidate_score_map=s._candidate_score_map(scored, candidate_indices)
+                candidate_scores=s._candidate_scores(logits, candidate_indices)
+                click_candidate_context=s._click_candidate_context_map(
+                    raw,
+                    candidate_indices,
+                    blocked_click_coord=blocked_click_coord,
+                    frame_hash=frame_hash,
+                    preferred_click_coord=preferred_click_coord,
+                    semantic_click_bonus_map=semantic_click_bonus_map,
+                    repeat_click_idx=repeat_click_bonus_idx,
+                    blocked_click_idx=blocked_click_idx,
+                    continuity_scale=continuity_scale,
+                )
+                direction_candidate_context=s._direction_candidate_context_map(
+                    raw,
+                    candidate_indices,
+                    frame_hash=frame_hash,
+                    blocked_direction=blocked_direction_idx,
+                    semantic_dirs=semantic_dirs,
+                    repeat_direction_idx=repeat_direction_bonus_idx,
+                    wait_recovery_bonus=wait_recovery_bonus,
+                )
                 best_local=0
                 best_score=float('-inf')
-                for i,top_idx in enumerate(candidate_indices):
-                    score=candidate_score_map.get(int(top_idx), float('-inf'))
+                for i,(top_idx,score) in enumerate(zip(candidate_indices, candidate_scores)):
                     if top_idx < 5:
+                        direction_context=direction_candidate_context[int(top_idx)]
+                        direction_blocked=direction_context["blocked"]
                         if (top_idx == 4 and retry_blocked_direction):
                             score=float('-inf')
-                        elif (not retry_blocked_direction and
-                                s._direction_matches_blocked_history(
-                                    top_idx,
-                                    raw,
-                                    frame_hash=frame_hash,
-                                    blocked_direction=blocked_direction_idx)):
+                        elif (not retry_blocked_direction and direction_blocked):
                             score=float('-inf')
                         else:
-                            score += semantic_dirs.get(top_idx, 0.0)
-                            if top_idx == 4:
-                                score += s._wait_recovery_bonus(
-                                    raw,
-                                    avail_ids,
-                                    blocked_click_coord=blocked_click_coord,
-                                    frame_hash=frame_hash,
-                                    avail_summary=avail_summary,
-                                )
-                        if (repeat_direction_bonus_idx is not None and
-                                top_idx == repeat_direction_bonus_idx and
-                                (retry_blocked_direction or
-                                 not s._direction_matches_blocked_history(
-                                     top_idx,
-                                     raw,
-                                     frame_hash=frame_hash,
-                                     blocked_direction=blocked_direction_idx))):
-                            score += 0.08
-                        score += s._bfs_priority_bonus(top_idx + 1)
+                            score += direction_context["semantic_bonus"]
+                            score += direction_context["wait_bonus"]
+                        if retry_blocked_direction or not direction_blocked:
+                            score += direction_context["repeat_bonus"]
+                        score += direction_context["bfs_bonus"]
                     else:
-                        click_coord=s._click_coord_from_action_index(top_idx)
-                        click_y,click_x=click_coord
-                        blocked_click_match=s._blocked_click_matches_coord(
-                            raw,
-                            click_coord,
-                            blocked_click_coord=blocked_click_coord,
-                            frame_hash=frame_hash,
-                        )
-                        if blocked_click_match:
+                        click_context=click_candidate_context[int(top_idx)]
+                        click_coord=click_context["coord"]
+                        if click_context["blocked"]:
                             score=float('-inf')
                         else:
-                            score += s._bfs_click_priority_bonus(click_coord)
-                            if s._wm is not None:
-                                score += float(s._wm[click_y, click_x]) * 0.05
-                            score += semantic_click_bonus_map.get(click_coord, 0.0)
-                            score += s._preferred_click_bonus(click_coord, preferred_click_coord)
-                            if (repeat_click_bonus_idx is not None and
-                                    top_idx == repeat_click_bonus_idx and
-                                    not blocked_click_match):
-                                score += 0.08
-                            if blocked_click_idx is not None and top_idx == blocked_click_idx:
+                            score += click_context["bfs_bonus"]
+                            score += click_context["wm_bonus"]
+                            score += click_context["semantic_bonus"]
+                            score += click_context["preferred_bonus"]
+                            score += click_context["repeat_bonus"]
+                            if click_context["is_blocked_idx"]:
                                 score=float('-inf')
                     if score > best_score:
                         best_score=score
@@ -2566,7 +2728,7 @@ class MyAgent(Agent):
             logger.debug("CNN action rescoring unavailable: %s", e)
         if aidx is None:
             aidx,coords=s._sample(logits, avail, temp=0.5, avail_ids=avail_ids)
-        return aidx,coords
+        return aidx,coords,selected_target_choice
 
     def _training_frequency_for_next_action(s, next_action_counter):
         """Return the train cadence for the next modeled action."""
@@ -2576,7 +2738,8 @@ class MyAgent(Agent):
         progress=min(1.0, next_action_counter / 150)
         return max(1, 5 - int(progress * 4))
 
-    def _finalize_modeled_action(s, aidx, coords, tensor, raw, frame_hash, blocked_click_coord):
+    def _finalize_modeled_action(s, aidx, coords, tensor, raw, frame_hash, blocked_click_coord,
+                                 target_choice=None):
         """Build, bookkeep, and optionally train after a modeled action choice."""
         if aidx < 5:
             sel=s._fresh_action(aidx + 1)
@@ -2589,6 +2752,8 @@ class MyAgent(Agent):
             raw,
             fallback_coord=coords if aidx >= 5 else None,
             blocked_click_coord=blocked_click_coord,
+            frame_hash=frame_hash,
+            target_choice=target_choice,
         )
         action_idx=aidx if aidx < 5 else s._click_action_index(coords)
         next_action_counter=s.action_counter + 1
@@ -2623,13 +2788,17 @@ class MyAgent(Agent):
         )
         if recent_progress_delta is not None and recent_progress_delta < -0.5:
             return None
+        click_avail=6 in avail_ids
         preferred_click=s._preferred_click_coord()
-        direct_click_choice=s._semantic_direct_click_choice(
-            raw,
-            avail,
-            avail_ids=avail_ids,
-            blocked_click_coord=blocked_click_coord,
-            frame_hash=frame_hash,
+        direct_click_choice=(
+            s._semantic_direct_click_choice(
+                raw,
+                avail,
+                avail_ids=avail_ids,
+                blocked_click_coord=blocked_click_coord,
+                frame_hash=frame_hash,
+            )
+            if click_avail else None
         )
         if direct_click_choice is not None:
             direct_click_coord=direct_click_choice[1]
@@ -2639,7 +2808,6 @@ class MyAgent(Agent):
             if direct_click_match_dist == 0 or direct_click_match_dist > 2:
                 return None
         semantic_dir=s._semantic_direction_action(raw, avail, avail_ids=avail_ids, frame_hash=frame_hash)
-        click_avail=6 in avail_ids
         semantic_clicks=(
             s._semantic_click_targets_compat(
                 raw,
@@ -3089,16 +3257,25 @@ class MyAgent(Agent):
 
     def _sample_sparse_policy_indices(s, logits, avail_ids, candidate_indices, temp=1.0):
         """Sample from legal directions plus a sparse subset of click indices."""
-        allp=torch.zeros(4101, dtype=logits.dtype, device=logits.device)
         dir_logits=logits[:5]
-        legal_dir_indices=[]
+        active_indices=[]
+        active_weights=[]
+        seen=set()
+
+        def add_candidate(idx, weight):
+            idx=int(idx)
+            if idx in seen:
+                return
+            seen.add(idx)
+            active_indices.append(idx)
+            active_weights.append(weight)
+
         for aid in (avail_ids or ()):
             if 1 <= aid <= 5:
                 idx=aid - 1
-                legal_dir_indices.append(idx)
                 logit=dir_logits[idx]
                 if torch.isfinite(logit):
-                    allp[idx]=torch.sigmoid(logit / temp)
+                    add_candidate(idx, torch.sigmoid(logit / temp))
         if candidate_indices:
             template_log_bias=s._template_log_bias()
             for idx in candidate_indices:
@@ -3109,26 +3286,41 @@ class MyAgent(Agent):
                 if template_log_bias is not None:
                     logit=logit + template_log_bias[idx - 5]
                 if torch.isfinite(logit):
-                    allp[idx]=torch.sigmoid(logit / temp) / (s.G * s.G)
-        sm=allp.sum()
-        if sm<1e-8:
-            finite_dir_found=False
-            for idx in legal_dir_indices:
+                    add_candidate(idx, torch.sigmoid(logit / temp) / (s.G * s.G))
+        if active_weights:
+            probs=torch.stack(active_weights)
+            sm=probs.sum()
+            if sm >= 1e-8:
+                chosen_local_idx=int(torch.multinomial(probs / sm, 1).item())
+                return s._decode_policy_action_index(active_indices[chosen_local_idx])
+
+        fallback_indices=[]
+        fallback_weights=[]
+        fallback_seen=set()
+
+        def add_fallback(idx):
+            idx=int(idx)
+            if idx in fallback_seen:
+                return
+            fallback_seen.add(idx)
+            fallback_indices.append(idx)
+            fallback_weights.append(torch.ones((), dtype=logits.dtype, device=logits.device))
+
+        for aid in (avail_ids or ()):
+            if 1 <= aid <= 5:
+                idx=aid - 1
                 if torch.isfinite(dir_logits[idx]):
-                    allp[idx]=1.0
-                    finite_dir_found=True
-            finite_click_found=False
+                    add_fallback(idx)
+        if candidate_indices:
             for idx in candidate_indices:
                 idx=int(idx)
                 if 5 <= idx < logits.numel() and torch.isfinite(logits[idx]):
-                    allp[idx]=1.0
-                    finite_click_found=True
-            if finite_dir_found or finite_click_found:
-                allp=allp / allp.sum()
-            else:
-                allp.fill_(1.0 / len(allp))
-        else:
-            allp=allp / sm
+                    add_fallback(idx)
+        if fallback_weights:
+            probs=torch.stack(fallback_weights)
+            chosen_local_idx=int(torch.multinomial(probs / probs.sum(), 1).item())
+            return s._decode_policy_action_index(fallback_indices[chosen_local_idx])
+        allp=torch.full((4101,), 1.0 / 4101, dtype=logits.dtype, device=logits.device)
         idx=int(torch.multinomial(allp, 1).item())
         return s._decode_policy_action_index(idx)
 
@@ -3154,6 +3346,143 @@ class MyAgent(Agent):
             candidate_indices,
             temp=temp,
         )
+
+    def _sample_semantic_exploration_sparse(s, frame, avail, avail_ids=None,
+                                            blocked_click_coord=None, frame_hash=None,
+                                            avail_summary=None, temp=1.0):
+        """Sample epsilon-exploration from sparse semantic candidates without dense click logits."""
+        if avail_ids is None:
+            avail_ids=s._available_action_ids(avail)
+        include_clicks=6 in (avail_ids or ())
+        if not include_clicks:
+            return None
+        if avail_summary is None:
+            avail_summary=s._availability_summary(avail_ids)
+        if frame_hash is None:
+            frame_hash=s._fast_frame_hash(frame)
+
+        direction_bonuses=s._semantic_direction_bonuses(
+            frame,
+            avail,
+            avail_ids=avail_ids,
+            frame_hash=frame_hash,
+            avail_summary=avail_summary,
+        )
+        wait_bonus=s._wait_recovery_bonus(
+            frame,
+            avail_ids,
+            blocked_click_coord=blocked_click_coord,
+            frame_hash=frame_hash,
+            avail_summary=avail_summary,
+        )
+        retry_blocked_direction=s._retry_blocked_direction_after_stale_wait(
+            frame,
+            avail_ids,
+            blocked_click_coord=blocked_click_coord,
+            frame_hash=frame_hash,
+            avail_summary=avail_summary,
+        )
+        blocked_direction=s._blocked_direction_action_index(frame, frame_hash=frame_hash)
+        active_indices=[]
+        active_weights=[]
+        seen=set()
+
+        def add_sparse_candidate(idx, logit, scale=1.0):
+            idx=int(idx)
+            if idx in seen:
+                return
+            if not math.isfinite(float(logit)):
+                return
+            seen.add(idx)
+            active_indices.append(idx)
+            active_weights.append(torch.sigmoid(torch.as_tensor(float(logit) / temp, device=s.device)) * float(scale))
+
+        for aid in (avail_ids or ()):
+            if not (1 <= aid <= 5):
+                continue
+            idx=aid - 1
+            if idx < 4 and not retry_blocked_direction and s._direction_matches_blocked_history(
+                    idx,
+                    frame,
+                    frame_hash=frame_hash,
+                    blocked_direction=blocked_direction):
+                continue
+            if idx == 4:
+                if wait_bonus > 0.0:
+                    add_sparse_candidate(4, max(float(direction_bonuses.get(4, 0.0)), float(wait_bonus)))
+                elif not retry_blocked_direction:
+                    add_sparse_candidate(4, float(direction_bonuses.get(4, 0.0)))
+            else:
+                add_sparse_candidate(idx, float(direction_bonuses.get(idx, 0.0)))
+
+        if include_clicks:
+            if blocked_click_coord is None:
+                blocked_click_coord=s._blocked_click_coord(frame, frame_hash=frame_hash)
+            click_targets=s._semantic_click_targets_compat(
+                frame,
+                limit=6,
+                blocked_click_coord=blocked_click_coord,
+                frame_hash=frame_hash,
+            )
+            candidate_indices=s._semantic_click_candidate_indices(
+                frame,
+                click_targets=click_targets,
+                blocked_click_coord=blocked_click_coord,
+                frame_hash=frame_hash,
+            )
+            if not candidate_indices:
+                return None
+            target_choice=s._semantic_target_choice(
+                frame,
+                blocked_click_coord=blocked_click_coord,
+                frame_hash=frame_hash,
+            )
+            click_scale=s._semantic_click_bonus_scale(
+                frame,
+                blocked_click_coord=blocked_click_coord,
+                frame_hash=frame_hash,
+                target_choice=target_choice,
+            )
+            click_bonus_map=s._semantic_click_bonus_map(
+                frame,
+                limit=6,
+                click_scale=click_scale,
+                click_targets=click_targets,
+            )
+            fallback_bonus_map={}
+            for rank,(ty,tx) in enumerate(s._heuristic_click_fallback_targets(
+                    frame,
+                    blocked_click_coord=blocked_click_coord,
+                    frame_hash=frame_hash)[:6]):
+                fallback_bonus_map[(int(ty), int(tx))]=max(0.0, 0.35 - 0.05 * rank) * click_scale
+            preferred_click_coord=s._preferred_click_coord()
+            continuity_scale=s._semantic_continuity_scale()
+            prefer_continuity_click=(preferred_click_coord is not None and continuity_scale > 0.5)
+            preferred_idx=None
+            if (prefer_continuity_click and
+                    not s._blocked_click_matches_coord(
+                        frame,
+                        preferred_click_coord,
+                        blocked_click_coord=blocked_click_coord,
+                        frame_hash=frame_hash)):
+                preferred_idx=s._click_action_index(preferred_click_coord)
+            for idx in candidate_indices:
+                click_coord=s._click_coord_from_action_index(idx)
+                click_logit=max(
+                    float(click_bonus_map.get(click_coord, 0.0)),
+                    float(fallback_bonus_map.get(click_coord, 0.0)),
+                    0.08 * click_scale if preferred_idx is not None and int(idx) == int(preferred_idx) else 0.0,
+                )
+                add_sparse_candidate(idx, click_logit, scale=1.0 / (s.G * s.G))
+
+        if not active_weights:
+            return None
+        probs=torch.stack(active_weights)
+        total=probs.sum()
+        if not torch.isfinite(total) or float(total.item()) < 1e-8:
+            return None
+        chosen_local_idx=int(torch.multinomial(probs / total, 1).item())
+        return s._decode_policy_action_index(active_indices[chosen_local_idx])
 
     def _legal_action_mask(s, logits, avail, avail_ids=None):
         """Mask logits down to currently legal modeled actions."""
@@ -3194,16 +3523,135 @@ class MyAgent(Agent):
                 click_added=True
         return count
 
+    def _top_legal_policy_indices(s, logits, avail_ids, limit, click_candidate_indices=None):
+        """Return the top raw legal policy indices without densifying a mask add."""
+        limit=max(0, int(limit))
+        if limit <= 0 or logits.numel() <= 0:
+            return []
+        if not avail_ids:
+            top=torch.topk(logits, min(limit, logits.numel()))
+            return [int(idx) for idx in top.indices.detach().cpu().tolist()]
+        scored_candidates=[]
+        for aid in avail_ids:
+            if 1 <= aid <= 5:
+                idx=aid - 1
+                score=float(logits[idx].item())
+                if math.isfinite(score):
+                    scored_candidates.append((score, idx))
+        if 6 in avail_ids and logits.numel() > 5:
+            sparse_click_indices=[
+                int(idx) for idx in (click_candidate_indices or ())
+                if 5 <= int(idx) < logits.numel()
+            ]
+            if sparse_click_indices:
+                sparse_click_scores=s._candidate_scores(logits, sparse_click_indices)
+                for idx,score in zip(sparse_click_indices, sparse_click_scores):
+                    score=float(score)
+                    if math.isfinite(score):
+                        scored_candidates.append((score, idx))
+            else:
+                click_logits=logits[5:]
+                click_limit=min(limit, int(click_logits.numel()))
+                if click_limit > 0:
+                    click_top=torch.topk(click_logits, click_limit)
+                    for score,rel_idx in zip(
+                            click_top.values.detach().cpu().tolist(),
+                            click_top.indices.detach().cpu().tolist()):
+                        score=float(score)
+                        if math.isfinite(score):
+                            scored_candidates.append((score, int(rel_idx) + 5))
+        if scored_candidates:
+            scored_candidates.sort(key=lambda item: item[0], reverse=True)
+            return [idx for _,idx in scored_candidates[:limit]]
+        avail_mask=s._legal_action_mask(logits, None, avail_ids=avail_ids)
+        legal_count=s._legal_modeled_action_count(len(logits), avail_ids)
+        top=torch.topk(logits + avail_mask, min(limit, legal_count))
+        return [int(idx) for idx in top.indices.detach().cpu().tolist()]
+
+    def _candidate_scores(s, scored, candidate_indices):
+        """Fetch candidate scores aligned with `candidate_indices` in one indexed read."""
+        if not candidate_indices:
+            return []
+        index_tensor=torch.as_tensor(candidate_indices, dtype=torch.long, device=scored.device)
+        return [
+            float(score)
+            for score in scored.index_select(0, index_tensor).detach().cpu().tolist()
+        ]
+
     def _candidate_score_map(s, scored, candidate_indices):
         """Fetch candidate scores with one indexed tensor read."""
-        if not candidate_indices:
-            return {}
-        index_tensor=torch.as_tensor(candidate_indices, dtype=torch.long, device=scored.device)
-        candidate_scores=scored.index_select(0, index_tensor).detach().cpu().tolist()
         return {
             int(idx): float(score)
-            for idx,score in zip(candidate_indices, candidate_scores)
+            for idx,score in zip(candidate_indices, s._candidate_scores(scored, candidate_indices))
         }
+
+    def _click_candidate_context_map(s, frame, candidate_indices, blocked_click_coord=None,
+                                     frame_hash=None, preferred_click_coord=None,
+                                     semantic_click_bonus_map=None, repeat_click_idx=None,
+                                     blocked_click_idx=None, continuity_scale=None):
+        """Precompute click candidate coords and static bonuses once per rescoring pass."""
+        context={}
+        semantic_click_bonus_map = semantic_click_bonus_map or {}
+        if continuity_scale is None:
+            continuity_scale=s._semantic_continuity_scale()
+        for idx in candidate_indices:
+            idx=int(idx)
+            if idx < 5 or idx in context:
+                continue
+            click_coord=s._click_coord_from_action_index(idx)
+            preferred_bonus=0.0
+            if preferred_click_coord is not None and continuity_scale > 0.0:
+                click_pref_dist=s._click_coord_distance(click_coord, preferred_click_coord)
+                if click_pref_dist == 0:
+                    preferred_bonus=0.08 * continuity_scale
+                elif click_pref_dist <= 2:
+                    preferred_bonus=0.04 * continuity_scale
+            context[idx]={
+                "coord": click_coord,
+                "blocked": s._blocked_click_matches_coord(
+                    frame,
+                    click_coord,
+                    blocked_click_coord=blocked_click_coord,
+                    frame_hash=frame_hash,
+                ),
+                "bfs_bonus": s._bfs_click_priority_bonus(click_coord),
+                "preferred_bonus": preferred_bonus,
+                "semantic_bonus": float(semantic_click_bonus_map.get(click_coord, 0.0)),
+                "repeat_bonus": 0.08 if repeat_click_idx is not None and idx == int(repeat_click_idx) else 0.0,
+                "is_blocked_idx": bool(blocked_click_idx is not None and idx == int(blocked_click_idx)),
+            }
+            if s._wm is not None:
+                click_y,click_x=click_coord
+                context[idx]["wm_bonus"]=float(s._wm[click_y, click_x]) * 0.05
+            else:
+                context[idx]["wm_bonus"]=0.0
+        return context
+
+    def _direction_candidate_context_map(s, frame, candidate_indices, frame_hash=None,
+                                         blocked_direction=None, semantic_dirs=None,
+                                         repeat_direction_idx=None, wait_recovery_bonus=0.0):
+        """Precompute direction candidate scoring state once per pass."""
+        context={}
+        for idx in candidate_indices:
+            idx=int(idx)
+            if idx < 0 or idx >= 5 or idx in context:
+                continue
+            context[idx]={
+                "blocked": (
+                    s._direction_matches_blocked_history(
+                        idx,
+                        frame,
+                        frame_hash=frame_hash,
+                        blocked_direction=blocked_direction,
+                    )
+                    if idx < 4 else False
+                ),
+                "bfs_bonus": s._bfs_priority_bonus(idx + 1),
+                "semantic_bonus": float((semantic_dirs or {}).get(idx, 0.0)),
+                "repeat_bonus": 0.08 if repeat_direction_idx is not None and idx == int(repeat_direction_idx) else 0.0,
+                "wait_bonus": float(wait_recovery_bonus) if idx == 4 else 0.0,
+            }
+        return context
 
     def _legal_direction_ids(s, avail_ids):
         """Reuse the legal directional action id set for a given availability pattern."""
@@ -3909,11 +4357,7 @@ class MyAgent(Agent):
             avail_summary=avail_summary,
         )
         current_blocked_direction=s._blocked_direction_action_index(frame, frame_hash=frame_hash)
-        target_choice=s._semantic_target_choice(
-            frame,
-            blocked_click_coord=blocked_click_coord,
-            frame_hash=frame_hash,
-        )
+        target_choice=None
         for action_idx, bonus in s._semantic_direction_bonuses(
                 frame,
                 avail,
@@ -3944,6 +4388,11 @@ class MyAgent(Agent):
         if include_clicks:
             if blocked_click_coord is None:
                 blocked_click_coord=s._blocked_click_coord(frame, frame_hash=frame_hash)
+            target_choice=s._semantic_target_choice(
+                frame,
+                blocked_click_coord=blocked_click_coord,
+                frame_hash=frame_hash,
+            )
             click_scale=s._semantic_click_bonus_scale(
                 frame,
                 blocked_click_coord=blocked_click_coord,
@@ -3951,6 +4400,8 @@ class MyAgent(Agent):
                 target_choice=target_choice,
             )
             preferred_click_coord=s._preferred_click_coord()
+            continuity_scale=s._semantic_continuity_scale()
+            prefer_continuity_click=(preferred_click_coord is not None and continuity_scale > 0.5)
             for rank,(ty,tx) in enumerate(s._semantic_click_targets_compat(
                     frame,
                     limit=6,
@@ -3966,7 +4417,7 @@ class MyAgent(Agent):
                 idx=s._click_action_index((ty, tx))
                 if 5 <= idx < logits.numel():
                     logits[idx] = max(float(logits[idx].item()), max(0.0, 0.35 - 0.05 * rank) * click_scale)
-            if (s._preferred_click_continuity_active() and
+            if (prefer_continuity_click and
                     not s._blocked_click_matches_coord(
                         frame,
                         preferred_click_coord,
@@ -4006,7 +4457,9 @@ class MyAgent(Agent):
 
     def _semantic_candidate_action_indices(s, frame, include_clicks, avail=None,
                                            direction_bonuses=None, click_targets=None,
-                                           blocked_click_coord=None, avail_ids=None, frame_hash=None):
+                                           click_candidate_indices=None,
+                                           blocked_click_coord=None, avail_ids=None, frame_hash=None,
+                                           wait_recovery_bonus=None):
         """Semantic action indices that should always participate in rescoring."""
         candidates=[]
         seen=set()
@@ -4014,24 +4467,30 @@ class MyAgent(Agent):
             avail_ids=s._available_action_ids(avail)
         if direction_bonuses is None:
             direction_bonuses=s._semantic_direction_bonuses(frame, avail, avail_ids=avail_ids, frame_hash=frame_hash)
+        if wait_recovery_bonus is None:
+            wait_recovery_bonus=s._wait_recovery_bonus(
+                frame,
+                avail_ids or (),
+                blocked_click_coord=blocked_click_coord,
+                frame_hash=frame_hash,
+            )
         for action_idx in direction_bonuses.keys():
             idx=int(action_idx)
             if 0 <= idx < 5 and idx not in seen:
                 seen.add(idx)
                 candidates.append(idx)
-        if s._wait_recovery_bonus(
-                frame,
-                avail_ids or (),
-                blocked_click_coord=blocked_click_coord,
-                frame_hash=frame_hash) > 0.0 and 4 not in seen:
+        if wait_recovery_bonus > 0.0 and 4 not in seen:
             seen.add(4)
             candidates.append(4)
         if include_clicks:
-            for idx in s._semantic_click_candidate_indices(
+            if click_candidate_indices is None:
+                click_candidate_indices=s._semantic_click_candidate_indices(
                     frame,
                     click_targets=click_targets,
                     blocked_click_coord=blocked_click_coord,
-                    frame_hash=frame_hash):
+                    frame_hash=frame_hash,
+                )
+            for idx in click_candidate_indices:
                 if idx not in seen and 5 <= idx < 4101:
                     seen.add(idx)
                     candidates.append(idx)
@@ -4058,9 +4517,12 @@ class MyAgent(Agent):
             return 1.0
         return max(0.25, min(1.0, 4.0 / max(float(goal_distance), 1.0)))
 
-    def _refresh_semantic_target_coord(s, frame, fallback_coord=None, blocked_click_coord=None, frame_hash=None):
+    def _refresh_semantic_target_coord(s, frame, fallback_coord=None, blocked_click_coord=None,
+                                       frame_hash=None, target_choice=None):
         """Track the current semantic target so later tie-breaks keep pursuing it."""
-        choice=s._semantic_target_choice(frame, blocked_click_coord=blocked_click_coord, frame_hash=frame_hash)
+        choice=target_choice
+        if choice is None:
+            choice=s._semantic_target_choice(frame, blocked_click_coord=blocked_click_coord, frame_hash=frame_hash)
         if choice is not None:
             s._semantic_target_coord=(int(round(choice['target_y'])), int(round(choice['target_x'])))
         elif (fallback_coord is not None and
@@ -4113,12 +4575,15 @@ class MyAgent(Agent):
         if avail_summary is None:
             avail_summary=s._availability_summary(avail_ids)
         av=avail_summary["legal_dirs"]
-        direct_click_choice=s._semantic_direct_click_choice(
-            frame,
-            avail,
-            avail_ids=avail_ids,
-            blocked_click_coord=blocked_click_coord,
-            frame_hash=frame_hash,
+        direct_click_choice=(
+            s._semantic_direct_click_choice(
+                frame,
+                avail,
+                avail_ids=avail_ids,
+                blocked_click_coord=blocked_click_coord,
+                frame_hash=frame_hash,
+            )
+            if avail_summary["has_click"] else None
         )
         if direct_click_choice is not None:
             return direct_click_choice
@@ -4413,7 +4878,15 @@ class MyAgent(Agent):
                     s.opt.zero_grad(set_to_none=True)
                     with s._amp_context():
                         logits = s.net.forward_actions(states)
+                        if not torch.isfinite(logits).all():
+                            logger.warning("BC training aborted: non-finite logits")
+                            s.net.eval()
+                            return None
                         loss = F.cross_entropy(logits, targets)
+                    if not torch.isfinite(loss):
+                        logger.warning("BC training aborted: non-finite loss")
+                        s.net.eval()
+                        return None
                     if s._grad_scaler is not None:
                         s._grad_scaler.scale(loss).backward()
                         s._grad_scaler.unscale_(s.opt)
@@ -4431,6 +4904,9 @@ class MyAgent(Agent):
             logger.warning(f"BC training failed: {e}")
             return None
         s.net.eval()
+        if step_count <= 0 or not math.isfinite(total_loss):
+            logger.warning("BC training aborted: non-finite aggregate loss")
+            return None
         s._model_revision += 1
         s._aem_encoded_cache_sig = None
         s._aem_encoded_cache = None
@@ -4960,13 +5436,14 @@ class MyAgent(Agent):
             forced_undo=s._maybe_force_undo(tensor, raw, ch)
             if forced_undo is not None:
                 return forced_undo
+            target_choice=None
             if not s._wd:
                 warmup_choice=s._prime_warmup_action(raw, avail, frame_hash=ch)
                 if warmup_choice is not None:
                     aidx,coords=warmup_choice
 
             if s._wd:
-                aidx,coords=s._choose_policy_action(
+                aidx,coords,target_choice=s._choose_policy_action(
                     tensor,
                     raw,
                     avail,
@@ -4987,6 +5464,7 @@ class MyAgent(Agent):
                 raw,
                 ch,
                 blocked_click_coord,
+                target_choice=target_choice if s._wd else None,
             )
 
         except Exception as e:
