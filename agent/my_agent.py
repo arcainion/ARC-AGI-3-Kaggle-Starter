@@ -32,6 +32,7 @@
 #         preserving learned exploration for CNN fallback.
 # =====================================================================
 import copy
+import bisect
 from concurrent.futures import ThreadPoolExecutor
 import gc
 import math
@@ -1488,6 +1489,10 @@ class MyAgent(Agent):
         s._ckpt_hash=None; s._unproductive=0; s._undo_avail=False
         s._blocked_click_history=deque(maxlen=3)
         s._blocked_direction_history=deque(maxlen=3)
+        s._blocked_click_history_version=0
+        s._blocked_direction_history_version=0
+        s._engine_action_ids={}
+        s._plain_engine_action_inputs={}
         s._eps=0.15; s._eps_min=0.02; s._eps_decay=0.9997; s._eps_steps=0
         s._prev_objs=None; s._obj_moved=0
         # FIX 1: Initialize _visited_hashes so _reward() deduplication works correctly
@@ -1519,12 +1524,38 @@ class MyAgent(Agent):
         s._recent_direction_progress_cache_value=None
         s._semantic_target_candidates_cache_key=None
         s._semantic_target_candidates_cache_value=None
+        s._semantic_direction_bonuses_cache_key=None
+        s._semantic_direction_bonuses_cache_value=None
+        s._semantic_exploration_logits_cache_key=None
+        s._semantic_exploration_logits_cache_value=None
+        s._semantic_exploration_sparse_cache_key=None
+        s._semantic_exploration_sparse_cache_value=None
+        s._sample_sparse_policy_cache_key=None
+        s._sample_sparse_policy_cache_value=None
+        s._top_legal_policy_cache_key=None
+        s._top_legal_policy_cache_value=None
+        s._candidate_scores_cache_key=None
+        s._candidate_scores_cache_value=None
+        s._candidate_score_map_cache_key=None
+        s._candidate_score_map_cache_value=None
+        s._click_candidate_context_cache_key=None
+        s._click_candidate_context_cache_value=None
+        s._click_targets_from_components_cache_key=None
+        s._click_targets_from_components_cache_value=None
+        s._rank_click_target_coords_cache_key=None
+        s._rank_click_target_coords_cache_value=None
+        s._append_unblocked_coords_cache_key=None
+        s._append_unblocked_coords_cache_value=None
         s._semantic_click_targets_cache_key=None
         s._semantic_click_targets_cache_value=None
+        s._semantic_click_bonus_cache_key=None
+        s._semantic_click_bonus_cache_value=None
         s._semantic_click_candidate_indices_cache_key=None
         s._semantic_click_candidate_indices_cache_value=None
         s._heuristic_click_fallback_cache_key=None
         s._heuristic_click_fallback_cache_value=None
+        s._heuristic_click_bonus_cache_key=None
+        s._heuristic_click_bonus_cache_value=None
         s._click_frontier_available_cache_key=None
         s._click_frontier_available_cache_value=None
         # TD-learning hyperparameters
@@ -1736,6 +1767,63 @@ class MyAgent(Agent):
             action.set_data(data)
         return action
 
+    def _engine_game_action(s, act_id):
+        """Reuse engine enum lookups for replay/BFS-style simulator calls."""
+        act_id=int(act_id)
+        try:
+            return s._engine_action_ids[act_id]
+        except KeyError:
+            action_id=GameAction.from_id(act_id)
+            s._engine_action_ids[act_id]=action_id
+            return action_id
+
+    def _engine_action_input(s, act_id, data=None):
+        """Build simulator-facing ActionInput values with no-payload caching."""
+        action_id=s._engine_game_action(act_id)
+        if data:
+            return ActionInput(id=action_id, data=dict(data))
+        act_id=int(act_id)
+        try:
+            return s._plain_engine_action_inputs[act_id]
+        except KeyError:
+            action_input=ActionInput(id=action_id)
+            s._plain_engine_action_inputs[act_id]=action_input
+            return action_input
+
+    def _demo_action_index(s, act_id, data):
+        """Map a BFS/demo `(act_id, data)` pair to the flat policy action index."""
+        act_id=int(act_id)
+        if act_id <= 5:
+            return act_id - 1
+        if not data:
+            return 0
+        return 5 + int(data.get('y', 0)) * s.G + int(data.get('x', 0))
+
+    def _compile_demo_actions(s, actions, limit=None):
+        """Precompute simulator inputs and flat policy indices for replay/demo loops."""
+        compiled=[]
+        seq=actions if limit is None else actions[:max(0, int(limit))]
+        for act_id, data in seq:
+            compiled.append((
+                int(act_id),
+                data,
+                s._demo_action_index(act_id, data),
+                s._engine_action_input(act_id, data=data),
+            ))
+        return compiled
+
+    def _make_replay_game_and_frame(s, level_idx):
+        """Instantiate a BFS replay game, reset it twice, and return the post-reset frame."""
+        if s._bfs is None:
+            return None, None
+        replay_game=s._bfs.game_cls()
+        replay_game.set_level(level_idx)
+        replay_game.perform_action(s._engine_action_input(GameAction.RESET.value if hasattr(GameAction.RESET, "value") else int(GameAction.RESET)), raw=True)
+        r0=replay_game.perform_action(s._engine_action_input(GameAction.RESET.value if hasattr(GameAction.RESET, "value") else int(GameAction.RESET)), raw=True)
+        if not r0 or not getattr(r0, 'frame', None):
+            return replay_game, None
+        return replay_game, _frame_view(r0.frame[-1], np.uint8)
+
     def _click_action_data(s, coord):
         """Build ACTION6 payload data from a `(y, x)` grid coordinate."""
         y, x = coord
@@ -1813,20 +1901,49 @@ class MyAgent(Agent):
         coords.insert(0, nearest_coord)
         return len(coords) >= limit
 
-    def _append_unblocked_coords(s, frame, candidates, coords, seen, limit, blocked_click_coord=None):
+    def _append_unblocked_coords(s, frame, candidates, coords, seen, limit, blocked_click_coord=None,
+                                 frame_hash=None):
         """Append unseen, unblocked coords until `limit` is reached."""
-        for coord in candidates:
+        if frame_hash is None:
+            frame_hash=s._fast_frame_hash(frame)
+        candidate_tuple=tuple((int(coord[0]), int(coord[1])) for coord in candidates)
+        seen_tuple=tuple(sorted((int(coord[0]), int(coord[1])) for coord in seen))
+        start_count=len(coords)
+        cache_key=(
+            int(frame_hash),
+            candidate_tuple,
+            seen_tuple,
+            int(start_count),
+            int(limit),
+            None if blocked_click_coord is None else (int(blocked_click_coord[0]), int(blocked_click_coord[1])),
+            s._blocked_click_history_signature(),
+        )
+        if s._append_unblocked_coords_cache_key == cache_key:
+            cached_additions=s._append_unblocked_coords_cache_value
+            for coord in cached_additions:
+                seen.add(coord)
+                coords.append(coord)
+            return len(coords) >= limit
+        blocked_match=s._blocked_click_matches_coord
+        additions=[]
+        for coord in candidate_tuple:
             if (coord in seen or
-                    s._blocked_click_matches_coord(
+                    blocked_match(
                         frame,
                         coord,
                         blocked_click_coord=blocked_click_coord,
+                        frame_hash=frame_hash,
                     )):
                 continue
             seen.add(coord)
             coords.append(coord)
+            additions.append(coord)
             if len(coords) >= limit:
+                s._append_unblocked_coords_cache_key=cache_key
+                s._append_unblocked_coords_cache_value=tuple(additions)
                 return True
+        s._append_unblocked_coords_cache_key=cache_key
+        s._append_unblocked_coords_cache_value=tuple(additions)
         return False
 
     def _append_candidate_index(s, candidate_indices, candidate_seen, idx, scored=None, avail_mask=None):
@@ -2001,13 +2118,16 @@ class MyAgent(Agent):
         return 0.3
 
     def _modeled_frontier_exhausted(s, frame, avail_ids, blocked_click_coord=None, frame_hash=None,
-                                    avail_summary=None):
+                                    avail_summary=None, stale_wait=None, blocked_direction=None):
         """Return True when every modeled movement/click frontier is currently exhausted."""
         if avail_summary is None:
             avail_summary=s._availability_summary(avail_ids or ())
-        if 5 in avail_ids and not s._stale_wait_recovery(frame):
+        if stale_wait is None:
+            stale_wait=s._stale_wait_recovery(frame)
+        if 5 in avail_ids and not stale_wait:
             return False
-        blocked_direction=s._blocked_direction_action_index(frame, frame_hash=frame_hash)
+        if blocked_direction is None:
+            blocked_direction=s._blocked_direction_action_index(frame, frame_hash=frame_hash)
         for aid in avail_summary["legal_dirs"]:
             if not s._direction_matches_blocked_history(
                     aid - 1,
@@ -2024,7 +2144,7 @@ class MyAgent(Agent):
         )
 
     def _retry_blocked_direction_after_stale_wait(s, frame, avail_ids, blocked_click_coord=None, frame_hash=None,
-                                                  avail_summary=None):
+                                                  avail_summary=None, blocked_direction=None):
         """Return True when stale wait recovery should retry blocked directions as a last resort."""
         if avail_summary is None:
             avail_summary=s._availability_summary(avail_ids or ())
@@ -2033,7 +2153,8 @@ class MyAgent(Agent):
         legal_dirs=avail_summary["legal_dirs"]
         if not legal_dirs:
             return False
-        blocked_direction=s._blocked_direction_action_index(frame, frame_hash=frame_hash)
+        if blocked_direction is None:
+            blocked_direction=s._blocked_direction_action_index(frame, frame_hash=frame_hash)
         if any(not s._direction_matches_blocked_history(
                 aid - 1,
                 frame,
@@ -2055,6 +2176,20 @@ class MyAgent(Agent):
             return False
         if avail_summary is None:
             avail_summary=s._availability_summary(avail_ids or ())
+        stale_wait=s._stale_wait_recovery(frame)
+        blocked_direction=None
+        if stale_wait or 5 not in (avail_ids or ()):
+            blocked_direction=s._blocked_direction_action_index(frame, frame_hash=frame_hash)
+        if stale_wait:
+            return s._modeled_frontier_exhausted(
+                frame,
+                avail_ids,
+                blocked_click_coord=blocked_click_coord,
+                frame_hash=frame_hash,
+                avail_summary=avail_summary,
+                stale_wait=True,
+                blocked_direction=blocked_direction,
+            )
         if s._wait_recovery_bonus(
                 frame,
                 avail_ids,
@@ -2068,15 +2203,98 @@ class MyAgent(Agent):
             blocked_click_coord=blocked_click_coord,
             frame_hash=frame_hash,
             avail_summary=avail_summary,
+            stale_wait=stale_wait,
+            blocked_direction=blocked_direction,
         )
 
-    def _semantic_click_bonus_map(s, frame, limit, click_scale, click_targets=None):
+    def _semantic_click_bonus_map(s, frame, limit, click_scale, click_targets=None,
+                                  blocked_click_coord=None, frame_hash=None):
         """Return ranked semantic click bonuses keyed by `(y, x)` coordinate."""
-        bonuses={}
+        if frame_hash is None:
+            frame_hash=s._fast_frame_hash(frame)
+        cache_key=None
         if click_targets is None:
-            click_targets=s._semantic_click_targets_compat(frame, limit=limit)
+            preferred_click_coord=s._preferred_click_coord()
+            cache_key=(
+                int(frame_hash),
+                int(limit),
+                round(float(click_scale), 6),
+                None if blocked_click_coord is None else (int(blocked_click_coord[0]), int(blocked_click_coord[1])),
+                None if preferred_click_coord is None else (int(preferred_click_coord[0]), int(preferred_click_coord[1])),
+                s._blocked_click_history_signature(),
+                round(float(s._semantic_continuity_scale()), 3),
+                None,
+            )
+            if s._semantic_click_bonus_cache_key == cache_key:
+                return s._semantic_click_bonus_cache_value
+        if click_targets is None:
+            click_targets=s._semantic_click_targets_compat(
+                frame,
+                limit=limit,
+                blocked_click_coord=blocked_click_coord,
+                frame_hash=frame_hash,
+            )
+        click_targets=tuple((int(ty), int(tx)) for ty,tx in click_targets[:max(0, int(limit))])
+        if cache_key is None:
+            cache_key=(
+                int(frame_hash),
+                int(limit),
+                round(float(click_scale), 6),
+                click_targets,
+            )
+        if s._semantic_click_bonus_cache_key == cache_key:
+            return s._semantic_click_bonus_cache_value
+        bonuses={}
         for rank,(ty,tx) in enumerate(click_targets):
             bonuses[(int(ty), int(tx))]=max(0.0, 0.8 - 0.1 * rank) * click_scale
+        s._semantic_click_bonus_cache_key=cache_key
+        s._semantic_click_bonus_cache_value=bonuses
+        return bonuses
+
+    def _heuristic_click_bonus_map(s, frame, limit, click_scale, blocked_click_coord=None,
+                                   frame_hash=None, fallback_targets=None):
+        """Return cached heuristic fallback click bonuses keyed by `(y, x)`."""
+        if frame_hash is None:
+            frame_hash=s._fast_frame_hash(frame)
+        cache_key=None
+        if fallback_targets is None:
+            cache_key=(
+                int(frame_hash),
+                int(limit),
+                round(float(click_scale), 6),
+                int(s._bg),
+                None if blocked_click_coord is None else (int(blocked_click_coord[0]), int(blocked_click_coord[1])),
+                s._blocked_click_history_signature(),
+                None,
+            )
+            if s._heuristic_click_bonus_cache_key == cache_key:
+                return s._heuristic_click_bonus_cache_value
+        if fallback_targets is None:
+            fallback_targets=s._heuristic_click_fallback_targets(
+                frame,
+                blocked_click_coord=blocked_click_coord,
+                frame_hash=frame_hash,
+            )
+        fallback_targets=tuple(
+            (int(ty), int(tx))
+            for ty,tx in fallback_targets[:max(0, int(limit))]
+        )
+        if cache_key is None:
+            cache_key=(
+                int(frame_hash),
+                int(limit),
+                round(float(click_scale), 6),
+                None if blocked_click_coord is None else (int(blocked_click_coord[0]), int(blocked_click_coord[1])),
+                s._blocked_click_history_signature(),
+                fallback_targets,
+            )
+        if s._heuristic_click_bonus_cache_key == cache_key:
+            return s._heuristic_click_bonus_cache_value
+        bonuses={}
+        for rank,(ty,tx) in enumerate(fallback_targets):
+            bonuses[(int(ty), int(tx))]=max(0.0, 0.35 - 0.05 * rank) * click_scale
+        s._heuristic_click_bonus_cache_key=cache_key
+        s._heuristic_click_bonus_cache_value=bonuses
         return bonuses
 
     def _semantic_click_bonus(s, click_coord, click_scale, click_targets):
@@ -2289,9 +2507,9 @@ class MyAgent(Agent):
         s.ph = None
         s._previous_frame_relation_cache = None
         if hasattr(s, '_blocked_click_history'):
-            s._blocked_click_history.clear()
+            s._clear_blocked_click_history()
         if hasattr(s, '_blocked_direction_history'):
-            s._blocked_direction_history.clear()
+            s._clear_blocked_direction_history()
 
     def _remember_blocked_click_coord(s, coord):
         """Remember a blocked click region so future click ranking avoids dead ends."""
@@ -2302,21 +2520,26 @@ class MyAgent(Agent):
             if s._coord_matches_blocked_click(coord, seen):
                 s._blocked_click_history.remove(seen)
                 s._blocked_click_history.append(coord)
+                s._blocked_click_history_version += 1
                 return
         s._blocked_click_history.append(coord)
+        s._blocked_click_history_version += 1
 
     def _clear_blocked_click_history(s):
         """Forget stale blocked click regions after the scene changes."""
-        s._blocked_click_history.clear()
+        if s._blocked_click_history:
+            s._blocked_click_history.clear()
+            s._blocked_click_history_version += 1
 
     def _decay_blocked_click_history(s):
         """Age out only the oldest blocked click region after real progress."""
         if s._blocked_click_history:
             s._blocked_click_history.popleft()
+            s._blocked_click_history_version += 1
 
     def _blocked_click_history_signature(s):
         """Return a stable cache-key signature for remembered blocked click regions."""
-        return tuple((int(coord[0]), int(coord[1])) for coord in s._blocked_click_history)
+        return int(s._blocked_click_history_version)
 
     def _remember_blocked_direction_index(s, direction_idx):
         """Remember a blocked directional move to avoid short-horizon ping-pong."""
@@ -2326,17 +2549,26 @@ class MyAgent(Agent):
         if direction_idx in s._blocked_direction_history:
             s._blocked_direction_history.remove(direction_idx)
             s._blocked_direction_history.append(direction_idx)
+            s._blocked_direction_history_version += 1
             return
         s._blocked_direction_history.append(direction_idx)
+        s._blocked_direction_history_version += 1
 
     def _clear_blocked_direction_history(s):
         """Forget stale blocked directions after the scene changes."""
-        s._blocked_direction_history.clear()
+        if s._blocked_direction_history:
+            s._blocked_direction_history.clear()
+            s._blocked_direction_history_version += 1
 
     def _decay_blocked_direction_history(s):
         """Age out only the oldest blocked direction after real progress."""
         if s._blocked_direction_history:
             s._blocked_direction_history.popleft()
+            s._blocked_direction_history_version += 1
+
+    def _blocked_direction_history_signature(s):
+        """Return a stable cache-key signature for remembered blocked directions."""
+        return int(s._blocked_direction_history_version)
 
     def _direction_matches_blocked_history(s, direction_idx, frame=None, frame_hash=None,
                                            blocked_direction=None):
@@ -2582,6 +2814,7 @@ class MyAgent(Agent):
                 blocked_click_coord=blocked_click_coord,
                 frame_hash=frame_hash,
                 avail_summary=avail_summary,
+                blocked_direction=blocked_direction_idx,
             )
             wait_recovery_bonus=s._wait_recovery_bonus(
                 raw,
@@ -3258,6 +3491,39 @@ class MyAgent(Agent):
     def _sample_sparse_policy_indices(s, logits, avail_ids, candidate_indices, temp=1.0):
         """Sample from legal directions plus a sparse subset of click indices."""
         dir_logits=logits[:5]
+        temp_inv=1.0 / max(float(temp), 1e-8)
+        click_weight_scale=1.0 / float(s.G * s.G)
+        template_log_bias=s._template_log_bias() if candidate_indices else None
+        logits_version=getattr(logits, "_version", None)
+        template_bias_version=getattr(template_log_bias, "_version", None) if template_log_bias is not None else None
+        cache_key=(
+            int(logits.data_ptr()),
+            logits_version,
+            tuple(int(aid) for aid in (avail_ids or ())),
+            tuple(int(idx) for idx in (candidate_indices or ())),
+            round(float(temp), 6),
+            int(logits.numel()),
+            logits.device.type,
+            getattr(logits.device, "index", None),
+            None if template_log_bias is None else int(template_log_bias.data_ptr()),
+            template_bias_version,
+        )
+        if s._sample_sparse_policy_cache_key == cache_key:
+            cached_mode,cached_payload=s._sample_sparse_policy_cache_value
+            if cached_mode == "single":
+                return cached_payload
+            if cached_mode == "weighted":
+                decoded_actions,cumulative_weights,total=cached_payload
+                threshold=random.random() * total
+                chosen_local_idx=bisect.bisect_left(cumulative_weights, threshold)
+                if chosen_local_idx >= len(decoded_actions):
+                    chosen_local_idx=len(decoded_actions) - 1
+                return decoded_actions[chosen_local_idx]
+            if cached_mode == "fallback":
+                fallback_decoded=cached_payload
+                return fallback_decoded[random.randrange(len(fallback_decoded))]
+            idx=random.randrange(4101)
+            return s._decode_policy_action_index(idx)
         active_indices=[]
         active_weights=[]
         seen=set()
@@ -3275,27 +3541,60 @@ class MyAgent(Agent):
                 idx=aid - 1
                 logit=dir_logits[idx]
                 if torch.isfinite(logit):
-                    add_candidate(idx, torch.sigmoid(logit / temp))
+                    logit=float(logit.item())
+                    scaled_logit=logit * temp_inv
+                    if scaled_logit >= 0.0:
+                        weight=1.0 / (1.0 + math.exp(-scaled_logit))
+                    else:
+                        exp_val=math.exp(scaled_logit)
+                        weight=exp_val / (1.0 + exp_val)
+                    add_candidate(idx, weight)
         if candidate_indices:
-            template_log_bias=s._template_log_bias()
             for idx in candidate_indices:
                 idx=int(idx)
                 if idx < 5 or idx >= logits.numel():
                     continue
-                logit=logits[idx]
+                logit=float(logits[idx].item())
                 if template_log_bias is not None:
-                    logit=logit + template_log_bias[idx - 5]
-                if torch.isfinite(logit):
-                    add_candidate(idx, torch.sigmoid(logit / temp) / (s.G * s.G))
+                    logit += float(template_log_bias[idx - 5].item())
+                if math.isfinite(logit):
+                    scaled_logit=logit * temp_inv
+                    if scaled_logit >= 0.0:
+                        weight=1.0 / (1.0 + math.exp(-scaled_logit))
+                    else:
+                        exp_val=math.exp(scaled_logit)
+                        weight=exp_val / (1.0 + exp_val)
+                    add_candidate(idx, weight * click_weight_scale)
         if active_weights:
-            probs=torch.stack(active_weights)
-            sm=probs.sum()
-            if sm >= 1e-8:
-                chosen_local_idx=int(torch.multinomial(probs / sm, 1).item())
-                return s._decode_policy_action_index(active_indices[chosen_local_idx])
+            sm=math.fsum(float(weight) for weight in active_weights)
+            if sm >= 1e-8 and math.isfinite(sm):
+                if len(active_indices) == 1:
+                    result=s._decode_policy_action_index(active_indices[0])
+                    s._sample_sparse_policy_cache_key=cache_key
+                    s._sample_sparse_policy_cache_value=("single", result)
+                    return result
+                cumulative_weights=[]
+                running=0.0
+                for weight in active_weights:
+                    running += float(weight)
+                    cumulative_weights.append(running)
+                decoded_actions=tuple(
+                    s._decode_policy_action_index(idx)
+                    for idx in active_indices
+                )
+                cumulative_weights=tuple(cumulative_weights)
+                s._sample_sparse_policy_cache_key=cache_key
+                s._sample_sparse_policy_cache_value=(
+                    "weighted",
+                    (decoded_actions, cumulative_weights, sm),
+                )
+                threshold=random.random() * sm
+                chosen_local_idx=bisect.bisect_left(cumulative_weights, threshold)
+                if chosen_local_idx >= len(decoded_actions):
+                    chosen_local_idx=len(decoded_actions) - 1
+                return decoded_actions[chosen_local_idx]
 
         fallback_indices=[]
-        fallback_weights=[]
         fallback_seen=set()
 
         def add_fallback(idx):
@@ -3304,7 +3603,6 @@ class MyAgent(Agent):
                 return
             fallback_seen.add(idx)
             fallback_indices.append(idx)
-            fallback_weights.append(torch.ones((), dtype=logits.dtype, device=logits.device))
 
         for aid in (avail_ids or ()):
             if 1 <= aid <= 5:
@@ -3316,12 +3614,23 @@ class MyAgent(Agent):
                 idx=int(idx)
                 if 5 <= idx < logits.numel() and torch.isfinite(logits[idx]):
                     add_fallback(idx)
-        if fallback_weights:
-            probs=torch.stack(fallback_weights)
-            chosen_local_idx=int(torch.multinomial(probs / probs.sum(), 1).item())
-            return s._decode_policy_action_index(fallback_indices[chosen_local_idx])
-        allp=torch.full((4101,), 1.0 / 4101, dtype=logits.dtype, device=logits.device)
-        idx=int(torch.multinomial(allp, 1).item())
+        if fallback_indices:
+            if len(fallback_indices) == 1:
+                result=s._decode_policy_action_index(fallback_indices[0])
+                s._sample_sparse_policy_cache_key=cache_key
+                s._sample_sparse_policy_cache_value=("single", result)
+                return result
+            fallback_decoded=tuple(
+                s._decode_policy_action_index(idx)
+                for idx in fallback_indices
+            )
+            s._sample_sparse_policy_cache_key=cache_key
+            s._sample_sparse_policy_cache_value=("fallback", fallback_decoded)
+            chosen_local_idx=random.randrange(len(fallback_decoded))
+            return fallback_decoded[chosen_local_idx]
+        s._sample_sparse_policy_cache_key=cache_key
+        s._sample_sparse_policy_cache_value=("uniform", None)
+        idx=random.randrange(4101)
         return s._decode_policy_action_index(idx)
 
     def _sample_semantic_exploration(s, logits, frame, avail, avail_ids=None,
@@ -3375,27 +3684,71 @@ class MyAgent(Agent):
             frame_hash=frame_hash,
             avail_summary=avail_summary,
         )
+        if blocked_click_coord is None:
+            blocked_click_coord=s._blocked_click_coord(frame, frame_hash=frame_hash)
+        blocked_direction=s._blocked_direction_action_index(frame, frame_hash=frame_hash)
         retry_blocked_direction=s._retry_blocked_direction_after_stale_wait(
             frame,
             avail_ids,
             blocked_click_coord=blocked_click_coord,
             frame_hash=frame_hash,
             avail_summary=avail_summary,
+            blocked_direction=blocked_direction,
         )
-        blocked_direction=s._blocked_direction_action_index(frame, frame_hash=frame_hash)
+        continuity_scale=0.0
+        preferred_click_coord=None
+        if s._unproductive < 8:
+            continuity_scale=0.35 if s._unproductive >= 6 else 1.0
+            if s._semantic_target_coord is not None:
+                preferred_click_coord=(
+                    int(s._semantic_target_coord[0]),
+                    int(s._semantic_target_coord[1]),
+                )
+        cache_key=(
+            int(frame_hash),
+            tuple(avail_ids) if avail_ids is not None else None,
+            None if blocked_click_coord is None else (int(blocked_click_coord[0]), int(blocked_click_coord[1])),
+            None if blocked_direction is None else int(blocked_direction),
+            bool(retry_blocked_direction),
+            int(s._bg),
+            round(float(temp), 6),
+            None if preferred_click_coord is None else preferred_click_coord,
+            round(float(continuity_scale), 3),
+            s._blocked_click_history_signature(),
+            s._blocked_direction_history_signature(),
+        )
+        if s._semantic_exploration_sparse_cache_key == cache_key:
+            cached=s._semantic_exploration_sparse_cache_value
+            if cached is None:
+                return None
+            active_indices,cumulative_weights,total=cached
+            threshold=random.random() * total
+            chosen_local_idx=bisect.bisect_left(cumulative_weights, threshold)
+            if chosen_local_idx >= len(active_indices):
+                chosen_local_idx=len(active_indices) - 1
+            return s._decode_policy_action_index(active_indices[chosen_local_idx])
         active_indices=[]
         active_weights=[]
         seen=set()
+        temp_inv=1.0 / max(float(temp), 1e-8)
+        click_weight_scale=1.0 / float(s.G * s.G)
 
         def add_sparse_candidate(idx, logit, scale=1.0):
             idx=int(idx)
             if idx in seen:
                 return
-            if not math.isfinite(float(logit)):
+            logit=float(logit)
+            if not math.isfinite(logit):
                 return
             seen.add(idx)
             active_indices.append(idx)
-            active_weights.append(torch.sigmoid(torch.as_tensor(float(logit) / temp, device=s.device)) * float(scale))
+            scaled_logit=logit * temp_inv
+            if scaled_logit >= 0.0:
+                weight=1.0 / (1.0 + math.exp(-scaled_logit))
+            else:
+                exp_val=math.exp(scaled_logit)
+                weight=exp_val / (1.0 + exp_val)
+            active_weights.append(weight * float(scale))
 
         for aid in (avail_ids or ()):
             if not (1 <= aid <= 5):
@@ -3416,8 +3769,6 @@ class MyAgent(Agent):
                 add_sparse_candidate(idx, float(direction_bonuses.get(idx, 0.0)))
 
         if include_clicks:
-            if blocked_click_coord is None:
-                blocked_click_coord=s._blocked_click_coord(frame, frame_hash=frame_hash)
             click_targets=s._semantic_click_targets_compat(
                 frame,
                 limit=6,
@@ -3448,15 +3799,16 @@ class MyAgent(Agent):
                 limit=6,
                 click_scale=click_scale,
                 click_targets=click_targets,
+                blocked_click_coord=blocked_click_coord,
+                frame_hash=frame_hash,
             )
-            fallback_bonus_map={}
-            for rank,(ty,tx) in enumerate(s._heuristic_click_fallback_targets(
-                    frame,
-                    blocked_click_coord=blocked_click_coord,
-                    frame_hash=frame_hash)[:6]):
-                fallback_bonus_map[(int(ty), int(tx))]=max(0.0, 0.35 - 0.05 * rank) * click_scale
-            preferred_click_coord=s._preferred_click_coord()
-            continuity_scale=s._semantic_continuity_scale()
+            fallback_bonus_map=s._heuristic_click_bonus_map(
+                frame,
+                limit=6,
+                click_scale=click_scale,
+                blocked_click_coord=blocked_click_coord,
+                frame_hash=frame_hash,
+            )
             prefer_continuity_click=(preferred_click_coord is not None and continuity_scale > 0.5)
             preferred_idx=None
             if (prefer_continuity_click and
@@ -3473,15 +3825,30 @@ class MyAgent(Agent):
                     float(fallback_bonus_map.get(click_coord, 0.0)),
                     0.08 * click_scale if preferred_idx is not None and int(idx) == int(preferred_idx) else 0.0,
                 )
-                add_sparse_candidate(idx, click_logit, scale=1.0 / (s.G * s.G))
+                add_sparse_candidate(idx, click_logit, scale=click_weight_scale)
 
         if not active_weights:
+            s._semantic_exploration_sparse_cache_key=cache_key
+            s._semantic_exploration_sparse_cache_value=None
             return None
-        probs=torch.stack(active_weights)
-        total=probs.sum()
-        if not torch.isfinite(total) or float(total.item()) < 1e-8:
+        total=math.fsum(active_weights)
+        if not math.isfinite(total) or total < 1e-8:
+            s._semantic_exploration_sparse_cache_key=cache_key
+            s._semantic_exploration_sparse_cache_value=None
             return None
-        chosen_local_idx=int(torch.multinomial(probs / total, 1).item())
+        cumulative_weights=[]
+        running=0.0
+        for weight in active_weights:
+            running += float(weight)
+            cumulative_weights.append(running)
+        active_indices=tuple(active_indices)
+        cumulative_weights=tuple(cumulative_weights)
+        s._semantic_exploration_sparse_cache_key=cache_key
+        s._semantic_exploration_sparse_cache_value=(active_indices, cumulative_weights, total)
+        threshold=random.random() * total
+        chosen_local_idx=bisect.bisect_left(cumulative_weights, threshold)
+        if chosen_local_idx >= len(active_indices):
+            chosen_local_idx=len(active_indices) - 1
         return s._decode_policy_action_index(active_indices[chosen_local_idx])
 
     def _legal_action_mask(s, logits, avail, avail_ids=None):
@@ -3528,27 +3895,38 @@ class MyAgent(Agent):
         limit=max(0, int(limit))
         if limit <= 0 or logits.numel() <= 0:
             return []
+        click_candidate_tuple=None
+        cache_key=(
+            int(logits.data_ptr()),
+            getattr(logits, '_version', None),
+            int(logits.numel()),
+            logits.device.type,
+            getattr(logits.device, 'index', None),
+            tuple(int(aid) for aid in (avail_ids or ())),
+            limit,
+            None if click_candidate_indices is None else tuple(int(idx) for idx in click_candidate_indices),
+        )
+        if s._top_legal_policy_cache_key == cache_key:
+            return list(s._top_legal_policy_cache_value)
         if not avail_ids:
             top=torch.topk(logits, min(limit, logits.numel()))
-            return [int(idx) for idx in top.indices.detach().cpu().tolist()]
-        scored_candidates=[]
+            result=[int(idx) for idx in top.indices.detach().cpu().tolist()]
+            s._top_legal_policy_cache_key=cache_key
+            s._top_legal_policy_cache_value=tuple(result)
+            return result
+        candidate_indices=[]
+        candidate_seen=set()
         for aid in avail_ids:
             if 1 <= aid <= 5:
-                idx=aid - 1
-                score=float(logits[idx].item())
-                if math.isfinite(score):
-                    scored_candidates.append((score, idx))
+                s._append_candidate_index(candidate_indices, candidate_seen, aid - 1, scored=logits)
         if 6 in avail_ids and logits.numel() > 5:
-            sparse_click_indices=[
+            click_candidate_tuple=tuple(
                 int(idx) for idx in (click_candidate_indices or ())
                 if 5 <= int(idx) < logits.numel()
-            ]
-            if sparse_click_indices:
-                sparse_click_scores=s._candidate_scores(logits, sparse_click_indices)
-                for idx,score in zip(sparse_click_indices, sparse_click_scores):
-                    score=float(score)
-                    if math.isfinite(score):
-                        scored_candidates.append((score, idx))
+            )
+            if click_candidate_tuple:
+                for idx in click_candidate_tuple:
+                    s._append_candidate_index(candidate_indices, candidate_seen, idx, scored=logits)
             else:
                 click_logits=logits[5:]
                 click_limit=min(limit, int(click_logits.numel()))
@@ -3557,74 +3935,165 @@ class MyAgent(Agent):
                     for score,rel_idx in zip(
                             click_top.values.detach().cpu().tolist(),
                             click_top.indices.detach().cpu().tolist()):
-                        score=float(score)
-                        if math.isfinite(score):
-                            scored_candidates.append((score, int(rel_idx) + 5))
-        if scored_candidates:
-            scored_candidates.sort(key=lambda item: item[0], reverse=True)
-            return [idx for _,idx in scored_candidates[:limit]]
+                        if math.isfinite(float(score)):
+                            s._append_candidate_index(
+                                candidate_indices,
+                                candidate_seen,
+                                int(rel_idx) + 5,
+                                scored=logits,
+                            )
+        if candidate_indices:
+            index_tensor=torch.as_tensor(candidate_indices, dtype=torch.long, device=logits.device)
+            candidate_scores=logits.index_select(0, index_tensor)
+            finite_mask=torch.isfinite(candidate_scores)
+            if finite_mask.any():
+                finite_scores=candidate_scores.masked_fill(~finite_mask, -float('inf'))
+                top_count=min(limit, int(finite_mask.sum().item()))
+                top=torch.topk(finite_scores, top_count)
+                result=[
+                    int(candidate_indices[int(pos)])
+                    for pos in top.indices.detach().cpu().tolist()
+                ]
+                s._top_legal_policy_cache_key=cache_key
+                s._top_legal_policy_cache_value=tuple(result)
+                return result
         avail_mask=s._legal_action_mask(logits, None, avail_ids=avail_ids)
         legal_count=s._legal_modeled_action_count(len(logits), avail_ids)
         top=torch.topk(logits + avail_mask, min(limit, legal_count))
-        return [int(idx) for idx in top.indices.detach().cpu().tolist()]
+        result=[int(idx) for idx in top.indices.detach().cpu().tolist()]
+        s._top_legal_policy_cache_key=cache_key
+        s._top_legal_policy_cache_value=tuple(result)
+        return result
 
     def _candidate_scores(s, scored, candidate_indices):
         """Fetch candidate scores aligned with `candidate_indices` in one indexed read."""
         if not candidate_indices:
             return []
-        index_tensor=torch.as_tensor(candidate_indices, dtype=torch.long, device=scored.device)
-        return [
-            float(score)
-            for score in scored.index_select(0, index_tensor).detach().cpu().tolist()
-        ]
+        candidate_tuple=tuple(int(idx) for idx in candidate_indices)
+        cache_key=(
+            int(scored.data_ptr()),
+            getattr(scored, '_version', None),
+            int(scored.numel()),
+            scored.device.type,
+            getattr(scored.device, 'index', None),
+            candidate_tuple,
+        )
+        if s._candidate_scores_cache_key == cache_key:
+            return list(s._candidate_scores_cache_value)
+        if len(candidate_tuple) <= 8:
+            result=[float(scored[idx].item()) for idx in candidate_tuple]
+        else:
+            index_tensor=torch.as_tensor(candidate_tuple, dtype=torch.long, device=scored.device)
+            result=[
+                float(score)
+                for score in scored.index_select(0, index_tensor).detach().cpu().tolist()
+            ]
+        s._candidate_scores_cache_key=cache_key
+        s._candidate_scores_cache_value=tuple(result)
+        return result
 
     def _candidate_score_map(s, scored, candidate_indices):
         """Fetch candidate scores with one indexed tensor read."""
-        return {
-            int(idx): float(score)
-            for idx,score in zip(candidate_indices, s._candidate_scores(scored, candidate_indices))
+        if not candidate_indices:
+            return {}
+        candidate_tuple=tuple(int(idx) for idx in candidate_indices)
+        cache_key=(
+            int(scored.data_ptr()),
+            getattr(scored, '_version', None),
+            int(scored.numel()),
+            scored.device.type,
+            getattr(scored.device, 'index', None),
+            candidate_tuple,
+        )
+        if s._candidate_score_map_cache_key == cache_key:
+            return s._candidate_score_map_cache_value
+        result={
+            idx: float(score)
+            for idx,score in zip(candidate_tuple, s._candidate_scores(scored, candidate_tuple))
         }
+        s._candidate_score_map_cache_key=cache_key
+        s._candidate_score_map_cache_value=result
+        return result
 
     def _click_candidate_context_map(s, frame, candidate_indices, blocked_click_coord=None,
                                      frame_hash=None, preferred_click_coord=None,
                                      semantic_click_bonus_map=None, repeat_click_idx=None,
                                      blocked_click_idx=None, continuity_scale=None):
         """Precompute click candidate coords and static bonuses once per rescoring pass."""
-        context={}
         semantic_click_bonus_map = semantic_click_bonus_map or {}
         if continuity_scale is None:
             continuity_scale=s._semantic_continuity_scale()
+        unique_click_indices=[]
+        seen=set()
         for idx in candidate_indices:
             idx=int(idx)
-            if idx < 5 or idx in context:
+            if idx < 5 or idx in seen:
                 continue
-            click_coord=s._click_coord_from_action_index(idx)
+            seen.add(idx)
+            unique_click_indices.append(idx)
+        if not unique_click_indices:
+            return {}
+        click_coords=tuple(s._click_coord_from_action_index(idx) for idx in unique_click_indices)
+        wm_bonus_samples=None
+        if s._wm is not None:
+            wm_bonus_samples=tuple(float(s._wm[click_y, click_x]) for click_y,click_x in click_coords)
+        cache_key=(
+            None if frame_hash is None else int(frame_hash),
+            tuple(unique_click_indices),
+            click_coords,
+            None if blocked_click_coord is None else (int(blocked_click_coord[0]), int(blocked_click_coord[1])),
+            None if preferred_click_coord is None else (int(preferred_click_coord[0]), int(preferred_click_coord[1])),
+            tuple(
+                ((int(coord[0]), int(coord[1])), round(float(bonus), 6))
+                for coord,bonus in semantic_click_bonus_map.items()
+            ),
+            None if repeat_click_idx is None else int(repeat_click_idx),
+            None if blocked_click_idx is None else int(blocked_click_idx),
+            round(float(continuity_scale), 6),
+            s._blocked_click_history_signature(),
+            wm_bonus_samples,
+        )
+        if s._click_candidate_context_cache_key == cache_key:
+            return s._click_candidate_context_cache_value
+        context={}
+        has_preferred=preferred_click_coord is not None and continuity_scale > 0.0
+        exact_preferred_bonus=0.08 * continuity_scale
+        near_preferred_bonus=0.04 * continuity_scale
+        repeat_click_idx_int=None if repeat_click_idx is None else int(repeat_click_idx)
+        blocked_click_idx_int=None if blocked_click_idx is None else int(blocked_click_idx)
+        semantic_bonus_get=semantic_click_bonus_map.get
+        bfs_bonus=s._bfs_click_priority_bonus
+        blocked_match=s._blocked_click_matches_coord
+        for pos,idx in enumerate(unique_click_indices):
+            click_coord=click_coords[pos]
             preferred_bonus=0.0
-            if preferred_click_coord is not None and continuity_scale > 0.0:
+            if has_preferred:
                 click_pref_dist=s._click_coord_distance(click_coord, preferred_click_coord)
                 if click_pref_dist == 0:
-                    preferred_bonus=0.08 * continuity_scale
+                    preferred_bonus=exact_preferred_bonus
                 elif click_pref_dist <= 2:
-                    preferred_bonus=0.04 * continuity_scale
-            context[idx]={
+                    preferred_bonus=near_preferred_bonus
+            item={
                 "coord": click_coord,
-                "blocked": s._blocked_click_matches_coord(
+                "blocked": blocked_match(
                     frame,
                     click_coord,
                     blocked_click_coord=blocked_click_coord,
                     frame_hash=frame_hash,
                 ),
-                "bfs_bonus": s._bfs_click_priority_bonus(click_coord),
+                "bfs_bonus": bfs_bonus(click_coord),
                 "preferred_bonus": preferred_bonus,
-                "semantic_bonus": float(semantic_click_bonus_map.get(click_coord, 0.0)),
-                "repeat_bonus": 0.08 if repeat_click_idx is not None and idx == int(repeat_click_idx) else 0.0,
-                "is_blocked_idx": bool(blocked_click_idx is not None and idx == int(blocked_click_idx)),
+                "semantic_bonus": float(semantic_bonus_get(click_coord, 0.0)),
+                "repeat_bonus": 0.08 if repeat_click_idx_int is not None and idx == repeat_click_idx_int else 0.0,
+                "is_blocked_idx": bool(blocked_click_idx_int is not None and idx == blocked_click_idx_int),
             }
-            if s._wm is not None:
-                click_y,click_x=click_coord
-                context[idx]["wm_bonus"]=float(s._wm[click_y, click_x]) * 0.05
+            if wm_bonus_samples is not None:
+                item["wm_bonus"]=wm_bonus_samples[pos] * 0.05
             else:
-                context[idx]["wm_bonus"]=0.0
+                item["wm_bonus"]=0.0
+            context[idx]=item
+        s._click_candidate_context_cache_key=cache_key
+        s._click_candidate_context_cache_value=context
         return context
 
     def _direction_candidate_context_map(s, frame, candidate_indices, frame_hash=None,
@@ -3687,13 +4156,29 @@ class MyAgent(Agent):
         return cached
 
     def _click_targets_from_components(s, frame, comps, preferred, preferred_coord,
-                                       blocked_click_coord):
+                                       blocked_click_coord, frame_hash=None):
         """Rank click targets from cached semantic components when no player target is known."""
         if not comps:
             return []
+        if frame_hash is None:
+            frame_hash=s._fast_frame_hash(frame)
         color_priority={14:0,6:1,9:2,11:3,5:4,7:5,13:6,15:7}
         continuity_scale=s._semantic_continuity_scale()
+        cache_key=(
+            int(frame_hash),
+            id(comps),
+            None if preferred is None else (int(preferred[0]), int(preferred[1])),
+            None if preferred_coord is None else (int(preferred_coord[0]), int(preferred_coord[1])),
+            None if blocked_click_coord is None else (int(blocked_click_coord[0]), int(blocked_click_coord[1])),
+            round(float(continuity_scale), 6),
+            s._blocked_click_history_signature(),
+        )
+        if s._click_targets_from_components_cache_key == cache_key:
+            return list(s._click_targets_from_components_cache_value)
         scored=[]
+        use_preferred=preferred is not None and continuity_scale > 0.0
+        preferred_y=None if preferred is None else int(preferred[0])
+        preferred_x=None if preferred is None else int(preferred[1])
         for key, items in comps.items():
             try:
                 color=int(key)
@@ -3711,8 +4196,8 @@ class MyAgent(Agent):
                 if area <= 0 or area > 512:
                     continue
                 distance=abs(cy-32)+abs(cx-32)
-                if preferred is not None and continuity_scale > 0.0:
-                    preferred_distance=abs(cy-preferred[0])+abs(cx-preferred[1])
+                if use_preferred:
+                    preferred_distance=abs(cy-preferred_y)+abs(cx-preferred_x)
                     continuity_distance=((continuity_scale * preferred_distance) +
                                          ((1.0 - continuity_scale) * distance))
                 else:
@@ -3731,17 +4216,35 @@ class MyAgent(Agent):
         scored_coords=[
             (item[4], item[5]) for item in scored
         ]
-        return s._rank_click_target_coords(
+        result=s._rank_click_target_coords(
             frame,
             scored_coords,
             preferred_coord,
             blocked_click_coord,
+            frame_hash=frame_hash,
         )
+        s._click_targets_from_components_cache_key=cache_key
+        s._click_targets_from_components_cache_value=tuple(result)
+        return result
 
-    def _rank_click_target_coords(s, frame, scored_coords, preferred_coord, blocked_click_coord):
+    def _rank_click_target_coords(s, frame, scored_coords, preferred_coord, blocked_click_coord,
+                                  frame_hash=None):
         """Return the full ranked click-target list for the current frame state."""
         if not scored_coords:
             return []
+        if frame_hash is None:
+            frame_hash=s._fast_frame_hash(frame)
+        scored_coords=tuple((int(coord[0]), int(coord[1])) for coord in scored_coords)
+        cache_key=(
+            int(frame_hash),
+            scored_coords,
+            None if preferred_coord is None else (int(preferred_coord[0]), int(preferred_coord[1])),
+            None if blocked_click_coord is None else (int(blocked_click_coord[0]), int(blocked_click_coord[1])),
+            round(float(s._semantic_continuity_scale()), 6),
+            s._blocked_click_history_signature(),
+        )
+        if s._rank_click_target_coords_cache_key == cache_key:
+            return list(s._rank_click_target_coords_cache_value)
         coords=[]
         seen=set()
         full_limit=max(1, len(scored_coords))
@@ -3753,6 +4256,8 @@ class MyAgent(Agent):
                 seen,
                 full_limit,
                 blocked_click_coord=blocked_click_coord):
+            s._rank_click_target_coords_cache_key=cache_key
+            s._rank_click_target_coords_cache_value=tuple(coords)
             return coords
         if s._append_unblocked_coords(
                 frame,
@@ -3760,8 +4265,13 @@ class MyAgent(Agent):
                 coords,
                 seen,
                 full_limit,
-                blocked_click_coord=blocked_click_coord):
+                blocked_click_coord=blocked_click_coord,
+                frame_hash=frame_hash):
+            s._rank_click_target_coords_cache_key=cache_key
+            s._rank_click_target_coords_cache_value=tuple(coords)
             return coords
+        s._rank_click_target_coords_cache_key=cache_key
+        s._rank_click_target_coords_cache_value=tuple(coords)
         return coords
 
     def _semantic_click_targets(s, frame, limit=8, blocked_click_coord=None, frame_hash=None):
@@ -3793,6 +4303,7 @@ class MyAgent(Agent):
                 scored_coords,
                 preferred_coord,
                 blocked_click_coord,
+                frame_hash=frame_hash,
             )
             s._semantic_click_targets_cache_key=cache_key
             s._semantic_click_targets_cache_value=coords
@@ -3804,6 +4315,7 @@ class MyAgent(Agent):
             preferred,
             preferred_coord,
             blocked_click_coord,
+            frame_hash=frame_hash,
         )
         s._semantic_click_targets_cache_key=cache_key
         s._semantic_click_targets_cache_value=coords
@@ -4254,30 +4766,48 @@ class MyAgent(Agent):
         """Soft directional preferences derived from semantic targets."""
         if avail_ids is None and avail is not None:
             avail_ids=s._available_action_ids(avail)
+        if frame_hash is None:
+            frame_hash=s._fast_frame_hash(frame)
         if avail_summary is None and avail_ids is not None:
             avail_summary=s._availability_summary(avail_ids)
         recent_direction=s._recent_direction_action_index(frame, frame_hash=frame_hash)
         opposite_recent=s._opposite_direction_index(recent_direction)
         blocked_click_coord=s._blocked_click_coord(frame, frame_hash=frame_hash)
+        blocked_direction=s._blocked_direction_action_index(frame, frame_hash=frame_hash)
         retry_blocked_direction=s._retry_blocked_direction_after_stale_wait(
             frame,
             avail_ids if avail_ids is not None else (),
             blocked_click_coord=blocked_click_coord,
             frame_hash=frame_hash,
             avail_summary=avail_summary,
+            blocked_direction=blocked_direction,
         )
         recent_progress_delta=s._recent_direction_progress_delta(
             frame,
             blocked_click_coord=blocked_click_coord,
             frame_hash=frame_hash,
         )
-        blocked_direction=s._blocked_direction_action_index(frame, frame_hash=frame_hash)
         legal_dirs=None
         if avail_summary is not None:
             legal_dirs=avail_summary["legal_dirs"]
             if not legal_dirs:
                 return {}
         preferred_axis=s._recent_direction_axis(frame, frame_hash=frame_hash)
+        cache_key=(
+            int(frame_hash),
+            tuple(avail_ids) if avail_ids is not None else None,
+            None if blocked_click_coord is None else (int(blocked_click_coord[0]), int(blocked_click_coord[1])),
+            None if blocked_direction is None else int(blocked_direction),
+            None if recent_direction is None else int(recent_direction),
+            None if opposite_recent is None else int(opposite_recent),
+            preferred_axis,
+            tuple(sorted(int(idx) for idx in legal_dirs)) if legal_dirs is not None else None,
+            bool(retry_blocked_direction),
+            None if recent_progress_delta is None else round(float(recent_progress_delta), 3),
+            s._blocked_direction_history_signature(),
+        )
+        if s._semantic_direction_bonuses_cache_key == cache_key:
+            return s._semantic_direction_bonuses_cache_value
         fallback_bonuses=None
         for choice in s._semantic_target_candidates(
                 frame,
@@ -4333,30 +4863,64 @@ class MyAgent(Agent):
                         (recent_progress_delta is None or recent_progress_delta >= -0.5)):
                     bonuses[opposite_recent] -= 0.30
                 if any(float(bonus) > 0.0 for bonus in bonuses.values()):
+                    s._semantic_direction_bonuses_cache_key=cache_key
+                    s._semantic_direction_bonuses_cache_value=bonuses
                     return bonuses
                 if (fallback_bonuses is None or
                         max(float(bonus) for bonus in bonuses.values()) >
                         max(float(bonus) for bonus in fallback_bonuses.values())):
                     fallback_bonuses=bonuses
-        return fallback_bonuses or {}
+        result=fallback_bonuses or {}
+        s._semantic_direction_bonuses_cache_key=cache_key
+        s._semantic_direction_bonuses_cache_value=result
+        return result
 
     def _semantic_exploration_logits(s, frame, avail, include_clicks, blocked_click_coord=None, avail_ids=None,
                                      frame_hash=None, avail_summary=None):
         """Bias exploratory sampling toward semantic movement/click targets."""
-        size=4101 if include_clicks else 5
-        logits=torch.zeros(size, device=s.device)
         if avail_ids is None:
             avail_ids=s._available_action_ids(avail)
         if avail_summary is None:
             avail_summary=s._availability_summary(avail_ids)
+        if frame_hash is None:
+            frame_hash=s._fast_frame_hash(frame)
+        current_blocked_direction=s._blocked_direction_action_index(frame, frame_hash=frame_hash)
         retry_blocked_direction=s._retry_blocked_direction_after_stale_wait(
             frame,
             avail_ids,
             blocked_click_coord=blocked_click_coord,
             frame_hash=frame_hash,
             avail_summary=avail_summary,
+            blocked_direction=current_blocked_direction,
         )
-        current_blocked_direction=s._blocked_direction_action_index(frame, frame_hash=frame_hash)
+        continuity_scale=0.0
+        preferred_click_coord=None
+        if include_clicks:
+            if s._unproductive < 8:
+                continuity_scale=0.35 if s._unproductive >= 6 else 1.0
+                if s._semantic_target_coord is not None:
+                    preferred_click_coord=(
+                        int(s._semantic_target_coord[0]),
+                        int(s._semantic_target_coord[1]),
+                    )
+        cache_key=(
+            int(frame_hash),
+            bool(include_clicks),
+            tuple(avail_ids) if avail_ids is not None else None,
+            None if blocked_click_coord is None else (int(blocked_click_coord[0]), int(blocked_click_coord[1])),
+            None if current_blocked_direction is None else int(current_blocked_direction),
+            bool(retry_blocked_direction),
+            None if preferred_click_coord is None else (int(preferred_click_coord[0]), int(preferred_click_coord[1])),
+            round(float(continuity_scale), 3),
+            s._blocked_click_history_signature(),
+            s._blocked_direction_history_signature(),
+            s.device.type,
+            getattr(s.device, 'index', None),
+        )
+        if s._semantic_exploration_logits_cache_key == cache_key:
+            return s._semantic_exploration_logits_cache_value
+        size=4101 if include_clicks else 5
+        logits=torch.zeros(size, device=s.device)
         target_choice=None
         for action_idx, bonus in s._semantic_direction_bonuses(
                 frame,
@@ -4399,8 +4963,6 @@ class MyAgent(Agent):
                 frame_hash=frame_hash,
                 target_choice=target_choice,
             )
-            preferred_click_coord=s._preferred_click_coord()
-            continuity_scale=s._semantic_continuity_scale()
             prefer_continuity_click=(preferred_click_coord is not None and continuity_scale > 0.5)
             for rank,(ty,tx) in enumerate(s._semantic_click_targets_compat(
                     frame,
@@ -4410,13 +4972,15 @@ class MyAgent(Agent):
                 idx=s._click_action_index((ty, tx))
                 if 5 <= idx < logits.numel():
                     logits[idx] = max(float(logits[idx].item()), max(0.0, 0.8 - 0.1 * rank) * click_scale)
-            for rank,(ty,tx) in enumerate(s._heuristic_click_fallback_targets(
+            for (ty,tx), bonus in s._heuristic_click_bonus_map(
                     frame,
+                    limit=6,
+                    click_scale=click_scale,
                     blocked_click_coord=blocked_click_coord,
-                    frame_hash=frame_hash)[:6]):
+                    frame_hash=frame_hash).items():
                 idx=s._click_action_index((ty, tx))
                 if 5 <= idx < logits.numel():
-                    logits[idx] = max(float(logits[idx].item()), max(0.0, 0.35 - 0.05 * rank) * click_scale)
+                    logits[idx] = max(float(logits[idx].item()), float(bonus))
             if (prefer_continuity_click and
                     not s._blocked_click_matches_coord(
                         frame,
@@ -4453,6 +5017,8 @@ class MyAgent(Agent):
                             continue
                         idx=s._click_action_index((ny, nx))
                         logits[idx] = -float('inf')
+        s._semantic_exploration_logits_cache_key=cache_key
+        s._semantic_exploration_logits_cache_value=logits
         return logits
 
     def _semantic_candidate_action_indices(s, frame, include_clicks, avail=None,
@@ -5061,18 +5627,12 @@ class MyAgent(Agent):
                 if s._bfs_solution and len(s._bfs_solution) > 1:
                     sol = s._bfs_solution
                     try:
-                        replay_game = s._bfs.game_cls()
-                        replay_game.set_level(lvl)
-                        replay_game.perform_action(ActionInput(id=GameAction.RESET), raw=True)
-                        r0 = replay_game.perform_action(ActionInput(id=GameAction.RESET), raw=True)
-                        if r0.frame:
-                            prev_frame = _frame_view(r0.frame[-1], np.uint8)
+                        replay_game, prev_frame = s._make_replay_game_and_frame(lvl)
+                        if prev_frame is not None:
+                            compiled_sol=s._compile_demo_actions(sol)
                             bc_frames = []  # collect raw frames for BC training
                             bc_actions = []
-                            for act_id, data in sol:
-                                action_idx = (act_id - 1) if act_id <= 5 else (
-                                    5 + data.get('y', 0) * 64 + data.get('x', 0) if data else 0)
-                                ai = ActionInput(id=GameAction.from_id(act_id), data=data) if data else ActionInput(id=GameAction.from_id(act_id))
+                            for act_id, data, action_idx, ai in compiled_sol:
                                 result = replay_game.perform_action(ai, raw=True)
                                 next_frame = _frame_view(result.frame[-1], np.uint8) if result and result.frame else None
                                 # BC only trains the 5-way directional head.
@@ -5114,18 +5674,12 @@ class MyAgent(Agent):
                 if lvl > 0 and s._bfs and s._bfs.solutions.get(lvl - 1):
                     prev_sol = s._bfs.solutions[lvl - 1]
                     try:
-                        replay_game = s._bfs.game_cls()
-                        replay_game.set_level(lvl - 1)
-                        replay_game.perform_action(ActionInput(id=GameAction.RESET), raw=True)
-                        r0 = replay_game.perform_action(ActionInput(id=GameAction.RESET), raw=True)
-                        if r0.frame:
+                        replay_game, prev_frame = s._make_replay_game_and_frame(lvl - 1)
+                        if prev_frame is not None:
+                            compiled_prev_sol=s._compile_demo_actions(prev_sol)
                             # Start from the post-reset frame, consistent with _raw()
-                            prev_frame = _frame_view(r0.frame[-1], np.uint8)
-                            for act_id, data in prev_sol:
-                                ai = ActionInput(id=GameAction.from_id(act_id), data=data) if data else ActionInput(id=GameAction.from_id(act_id))
+                            for _act_id, _data, action_idx, ai in compiled_prev_sol:
                                 result = replay_game.perform_action(ai, raw=True)
-                                action_idx = (act_id - 1) if act_id <= 5 else (
-                                    5 + data.get('y', 0) * 64 + data.get('x', 0) if data else 0)
                                 s._add_replay(prev_frame, action_idx, 2.0)
                                 # Advance prev_frame using the action result, not get_pixels()
                                 if result.frame:
@@ -5153,16 +5707,10 @@ class MyAgent(Agent):
                     eff = s._bfs._last_effective_actions
                     count = 0
                     try:
-                        replay_game = s._bfs.game_cls()
-                        replay_game.set_level(lvl)
-                        replay_game.perform_action(ActionInput(id=GameAction.RESET), raw=True)
-                        r0 = replay_game.perform_action(ActionInput(id=GameAction.RESET), raw=True)
-                        if r0.frame:
-                            root_frame = _frame_view(r0.frame[-1], np.uint8)
-                            for act_id, data in eff[:500]:
-                                action_idx = (act_id - 1) if act_id <= 5 else (
-                                    5 + data.get('y', 0) * s.G + data.get('x', 0) if data else 0)
-                                ai = ActionInput(id=GameAction.from_id(act_id), data=data) if data else ActionInput(id=GameAction.from_id(act_id))
+                        replay_game, root_frame = s._make_replay_game_and_frame(lvl)
+                        if root_frame is not None:
+                            compiled_eff=s._compile_demo_actions(eff, limit=500)
+                            for act_id, data, action_idx, ai in compiled_eff:
                                 g = s._bfs._clone_game(replay_game)
                                 result = g.perform_action(ai, raw=True)
                                 if result.frame:
@@ -5177,9 +5725,7 @@ class MyAgent(Agent):
                                 count += 1
                     except Exception:
                         raw_frame = s._raw(lf)
-                        for act_id, data in eff[:500]:
-                            action_idx = (act_id - 1) if act_id <= 5 else (
-                                5 + data.get('y', 0) * s.G + data.get('x', 0) if data else 0)
+                        for act_id, data, action_idx, _ai in s._compile_demo_actions(eff, limit=500):
                             s._add_replay(raw_frame, action_idx, 0.8)
                             if act_id == 6 and data and s._wm is not None:
                                 x, y = data.get('x', -1), data.get('y', -1)
@@ -5194,12 +5740,9 @@ class MyAgent(Agent):
                     tree_count = 0
                     if eff:
                         try:
-                            tree_game = s._bfs.game_cls()
-                            tree_game.set_level(lvl)
-                            tree_game.perform_action(ActionInput(id=GameAction.RESET), raw=True)
-                            r0 = tree_game.perform_action(ActionInput(id=GameAction.RESET), raw=True)
-                            if r0.frame:
-                                root_frame = _frame_view(r0.frame[-1], np.uint8)
+                            tree_game, root_frame = s._make_replay_game_and_frame(lvl)
+                            if root_frame is not None:
+                                compiled_probe_eff=s._compile_demo_actions(eff, limit=min(10, len(eff)))
                                 # Find the BFS start state by probing direction actions
                                 # until some eff action produces a visible frame change.
                                 start_game = tree_game
@@ -5209,15 +5752,14 @@ class MyAgent(Agent):
                                     for warmup_id in [0] + list(range(1, 5)):
                                         g_probe = s._bfs._clone_game(probe_state) if warmup_id > 0 else probe_state
                                         if warmup_id > 0:
-                                            ai_warm = ActionInput(id=GameAction.from_id(warmup_id))
+                                            ai_warm = s._engine_action_input(warmup_id)
                                             rw = g_probe.perform_action(ai_warm, raw=True)
                                             if not rw or not rw.frame:
                                                 continue
                                         probe_frame = _frame_view(rw.frame[-1], np.uint8) if warmup_id > 0 else root_frame
                                         # Check if any eff action works from this state
-                                        for act_id, data in eff[:min(10, len(eff))]:
+                                        for _act_id, _data, _action_idx, ai in compiled_probe_eff:
                                             g_test = s._bfs._clone_game(g_probe if warmup_id > 0 else probe_state)
-                                            ai = ActionInput(id=GameAction.from_id(act_id), data=data) if data else ActionInput(id=GameAction.from_id(act_id))
                                             result = g_test.perform_action(ai, raw=True)
                                             if result and result.frame:
                                                 test_frame = _frame_view(result.frame[-1], np.uint8)
@@ -5232,6 +5774,8 @@ class MyAgent(Agent):
                                         break
                                 sorted_eff = sorted(eff, key=lambda a: s._bfs._action_priority.get(s._bfs._action_key(a[0], a[1]), 0), reverse=True)
                                 top_eff = sorted_eff[:min(3, len(sorted_eff))]
+                                compiled_sorted_eff=s._compile_demo_actions(sorted_eff)
+                                compiled_top_eff=s._compile_demo_actions(top_eff)
                                 frontier = deque()
                                 frontier.append((start_game, start_frame, 0))
                                 tree_visited = {s._fast_frame_hash(start_frame)}
@@ -5245,15 +5789,12 @@ class MyAgent(Agent):
                                     if depth >= max_depth:
                                         continue
                                     children = []
-                                    branch_eff = sorted_eff if depth == 0 else top_eff
-                                    for act_id, data in branch_eff:
+                                    branch_eff = compiled_sorted_eff if depth == 0 else compiled_top_eff
+                                    for act_id, data, action_idx, ai in branch_eff:
                                         if tree_attempts >= tree_attempt_limit:
                                             break
                                         tree_attempts += 1
-                                        action_idx = (act_id - 1) if act_id <= 5 else (
-                                            5 + data.get('y', 0) * s.G + data.get('x', 0) if data else 0)
                                         g = s._bfs._clone_game(parent_game)
-                                        ai = ActionInput(id=GameAction.from_id(act_id), data=data) if data else ActionInput(id=GameAction.from_id(act_id))
                                         result = g.perform_action(ai, raw=True)
                                         if result and result.frame:
                                             child_frame = _frame_view(result.frame[-1], np.uint8)
