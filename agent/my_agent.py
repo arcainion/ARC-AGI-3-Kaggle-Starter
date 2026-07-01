@@ -1526,6 +1526,8 @@ class MyAgent(Agent):
         s._semantic_target_candidates_cache_value=None
         s._semantic_direction_bonuses_cache_key=None
         s._semantic_direction_bonuses_cache_value=None
+        s._semantic_direction_action_cache_key=None
+        s._semantic_direction_action_cache_value=None
         s._semantic_exploration_logits_cache_key=None
         s._semantic_exploration_logits_cache_value=None
         s._semantic_exploration_sparse_cache_key=None
@@ -1546,6 +1548,8 @@ class MyAgent(Agent):
         s._rank_click_target_coords_cache_value=None
         s._append_unblocked_coords_cache_key=None
         s._append_unblocked_coords_cache_value=None
+        s._modeled_frontier_exhausted_cache_key=None
+        s._modeled_frontier_exhausted_cache_value=None
         s._semantic_click_targets_cache_key=None
         s._semantic_click_targets_cache_value=None
         s._semantic_click_bonus_cache_key=None
@@ -2102,13 +2106,8 @@ class MyAgent(Agent):
         if s._unproductive < 6 or not avail_summary["has_modeled"] or 5 not in (avail_ids or ()) or s._stale_wait_recovery(frame):
             return 0.0
         blocked_direction=s._blocked_direction_action_index(frame, frame_hash=frame_hash)
-        for aid in avail_summary["legal_dirs"]:
-            if not s._direction_matches_blocked_history(
-                    aid - 1,
-                    frame,
-                    frame_hash=frame_hash,
-                    blocked_direction=blocked_direction):
-                return 0.0
+        if not s._all_legal_dirs_blocked(avail_summary["legal_dirs"], blocked_direction):
+            return 0.0
         if (avail_summary["has_click"] and
                 s._has_click_frontier(
                     frame,
@@ -2128,20 +2127,40 @@ class MyAgent(Agent):
             return False
         if blocked_direction is None:
             blocked_direction=s._blocked_direction_action_index(frame, frame_hash=frame_hash)
-        for aid in avail_summary["legal_dirs"]:
-            if not s._direction_matches_blocked_history(
-                    aid - 1,
-                    frame,
-                    frame_hash=frame_hash,
-                    blocked_direction=blocked_direction):
-                return False
+        cache_key=(
+            None if frame_hash is None else int(frame_hash),
+            tuple(avail_ids) if avail_ids is not None else None,
+            None if blocked_click_coord is None else (int(blocked_click_coord[0]), int(blocked_click_coord[1])),
+            bool(stale_wait),
+            None if blocked_direction is None else int(blocked_direction),
+            bool(avail_summary["has_click"]),
+            tuple(sorted(int(aid) for aid in avail_summary["legal_dirs"])),
+            s._blocked_direction_history_signature(),
+            s._blocked_click_history_signature(),
+            None if s._semantic_target_coord is None else (
+                int(s._semantic_target_coord[0]),
+                int(s._semantic_target_coord[1]),
+            ),
+            round(float(s._semantic_continuity_scale()), 3),
+        )
+        if s._modeled_frontier_exhausted_cache_key == cache_key:
+            return s._modeled_frontier_exhausted_cache_value
+        if not s._all_legal_dirs_blocked(avail_summary["legal_dirs"], blocked_direction):
+            s._modeled_frontier_exhausted_cache_key=cache_key
+            s._modeled_frontier_exhausted_cache_value=False
+            return False
         if not avail_summary["has_click"]:
+            s._modeled_frontier_exhausted_cache_key=cache_key
+            s._modeled_frontier_exhausted_cache_value=True
             return True
-        return not s._has_click_frontier(
+        result=not s._has_click_frontier(
             frame,
             blocked_click_coord=blocked_click_coord,
             frame_hash=frame_hash,
         )
+        s._modeled_frontier_exhausted_cache_key=cache_key
+        s._modeled_frontier_exhausted_cache_value=result
+        return result
 
     def _retry_blocked_direction_after_stale_wait(s, frame, avail_ids, blocked_click_coord=None, frame_hash=None,
                                                   avail_summary=None, blocked_direction=None):
@@ -2155,11 +2174,7 @@ class MyAgent(Agent):
             return False
         if blocked_direction is None:
             blocked_direction=s._blocked_direction_action_index(frame, frame_hash=frame_hash)
-        if any(not s._direction_matches_blocked_history(
-                aid - 1,
-                frame,
-                frame_hash=frame_hash,
-                blocked_direction=blocked_direction) for aid in legal_dirs):
+        if not s._all_legal_dirs_blocked(legal_dirs, blocked_direction):
             return False
         if (avail_summary["has_click"] and
                 s._has_click_frontier(
@@ -2406,7 +2421,8 @@ class MyAgent(Agent):
         return progress_delta
 
     def _semantic_direct_click_choice(s, frame, avail=None, avail_ids=None,
-                                      blocked_click_coord=None, frame_hash=None):
+                                      blocked_click_coord=None, frame_hash=None,
+                                      target_choice=None):
         """Commit to ACTION6 when a top semantic target is already directly clickable."""
         if avail_ids is None:
             avail_ids=s._available_action_ids(avail)
@@ -2414,13 +2430,12 @@ class MyAgent(Agent):
             return None
         if frame_hash is None:
             frame_hash=s._fast_frame_hash(frame)
-        preferred_click_coord=s._preferred_click_coord()
-        prefer_continuity_click=s._preferred_click_continuity_active()
-        target_choice=s._semantic_target_choice(
-            frame,
-            blocked_click_coord=blocked_click_coord,
-            frame_hash=frame_hash,
-        )
+        if target_choice is None:
+            target_choice=s._semantic_target_choice(
+                frame,
+                blocked_click_coord=blocked_click_coord,
+                frame_hash=frame_hash,
+            )
         if not target_choice:
             comps=s._semantic_components(frame, frame_hash=frame_hash) or {}
             has_player=bool((comps.get('4') or []) or (comps.get('12') or []))
@@ -2441,6 +2456,8 @@ class MyAgent(Agent):
                     if coord not in direct_click_candidates:
                         direct_click_candidates.append(coord)
                 if direct_click_candidates:
+                    preferred_click_coord=s._preferred_click_coord()
+                    prefer_continuity_click=s._preferred_click_continuity_active()
                     direct_click_coord=None
                     if (prefer_continuity_click and
                             not s._blocked_click_matches_coord(
@@ -2462,6 +2479,8 @@ class MyAgent(Agent):
             int(round(target_choice['target_y'])),
             int(round(target_choice['target_x'])),
         )
+        preferred_click_coord=s._preferred_click_coord()
+        prefer_continuity_click=s._preferred_click_continuity_active()
         candidate_coords=[]
         if (prefer_continuity_click and
                 not s._blocked_click_matches_coord(
@@ -2582,6 +2601,19 @@ class MyAgent(Agent):
             return True
         return direction_idx in s._blocked_direction_history
 
+    def _all_legal_dirs_blocked(s, legal_action_ids, blocked_direction):
+        """Return True when every legal direction is blocked now or by recent history."""
+        if not legal_action_ids:
+            return False
+        blocked_history=s._blocked_direction_history
+        for aid in legal_action_ids:
+            direction_idx=int(aid) - 1
+            if blocked_direction is not None and int(blocked_direction) == direction_idx:
+                continue
+            if direction_idx not in blocked_history:
+                return False
+        return True
+
     def _snapshot_frame(s, raw):
         """Return an owned snapshot for history and previous-frame bookkeeping."""
         return raw.copy()
@@ -2680,9 +2712,19 @@ class MyAgent(Agent):
         """Return UNDO after a long unproductive streak when it is legal."""
         if not (s._undo_avail and s._ckpt_hash):
             return None
+        if s._unproductive >= 30:
+            s._unproductive=0
+            return s._finalize_control_action(
+                7,
+                "undo",
+                tensor=tensor,
+                raw=raw,
+                frame_hash=frame_hash,
+                remember_recent=True,
+            )
         prev_h=s.ph if s.ph is not None else (s._fast_frame_hash(s.pr) if s.pr is not None else None)
         loop_revisit=(prev_h is not None and s._recent_frame_revisit_penalty(frame_hash, prev_h) > 0.0)
-        if not (s._unproductive >= 30 or loop_revisit):
+        if not loop_revisit:
             return None
         s._unproductive=0
         return s._finalize_control_action(
@@ -3721,12 +3763,12 @@ class MyAgent(Agent):
             cached=s._semantic_exploration_sparse_cache_value
             if cached is None:
                 return None
-            active_indices,cumulative_weights,total=cached
+            decoded_actions,cumulative_weights,total=cached
             threshold=random.random() * total
             chosen_local_idx=bisect.bisect_left(cumulative_weights, threshold)
-            if chosen_local_idx >= len(active_indices):
-                chosen_local_idx=len(active_indices) - 1
-            return s._decode_policy_action_index(active_indices[chosen_local_idx])
+            if chosen_local_idx >= len(decoded_actions):
+                chosen_local_idx=len(decoded_actions) - 1
+            return decoded_actions[chosen_local_idx]
         active_indices=[]
         active_weights=[]
         seen=set()
@@ -3841,15 +3883,18 @@ class MyAgent(Agent):
         for weight in active_weights:
             running += float(weight)
             cumulative_weights.append(running)
-        active_indices=tuple(active_indices)
+        decoded_actions=tuple(
+            s._decode_policy_action_index(idx)
+            for idx in active_indices
+        )
         cumulative_weights=tuple(cumulative_weights)
         s._semantic_exploration_sparse_cache_key=cache_key
-        s._semantic_exploration_sparse_cache_value=(active_indices, cumulative_weights, total)
+        s._semantic_exploration_sparse_cache_value=(decoded_actions, cumulative_weights, total)
         threshold=random.random() * total
         chosen_local_idx=bisect.bisect_left(cumulative_weights, threshold)
-        if chosen_local_idx >= len(active_indices):
-            chosen_local_idx=len(active_indices) - 1
-        return s._decode_policy_action_index(active_indices[chosen_local_idx])
+        if chosen_local_idx >= len(decoded_actions):
+            chosen_local_idx=len(decoded_actions) - 1
+        return decoded_actions[chosen_local_idx]
 
     def _legal_action_mask(s, logits, avail, avail_ids=None):
         """Mask logits down to currently legal modeled actions."""
@@ -4033,34 +4078,39 @@ class MyAgent(Agent):
             unique_click_indices.append(idx)
         if not unique_click_indices:
             return {}
-        click_coords=tuple(s._click_coord_from_action_index(idx) for idx in unique_click_indices)
-        wm_bonus_samples=None
-        if s._wm is not None:
-            wm_bonus_samples=tuple(float(s._wm[click_y, click_x]) for click_y,click_x in click_coords)
+        semantic_bonus_signature=(
+            ("cached", s._semantic_click_bonus_cache_key)
+            if semantic_click_bonus_map is s._semantic_click_bonus_cache_value
+            else tuple(
+                ((int(coord[0]), int(coord[1])), round(float(bonus), 6))
+                for coord,bonus in semantic_click_bonus_map.items()
+            )
+        )
         cache_key=(
             None if frame_hash is None else int(frame_hash),
             tuple(unique_click_indices),
-            click_coords,
             None if blocked_click_coord is None else (int(blocked_click_coord[0]), int(blocked_click_coord[1])),
             None if preferred_click_coord is None else (int(preferred_click_coord[0]), int(preferred_click_coord[1])),
-            tuple(
-                ((int(coord[0]), int(coord[1])), round(float(bonus), 6))
-                for coord,bonus in semantic_click_bonus_map.items()
-            ),
+            semantic_bonus_signature,
             None if repeat_click_idx is None else int(repeat_click_idx),
             None if blocked_click_idx is None else int(blocked_click_idx),
             round(float(continuity_scale), 6),
             s._blocked_click_history_signature(),
-            wm_bonus_samples,
+            None if s._wm is None else id(s._wm),
         )
         if s._click_candidate_context_cache_key == cache_key:
             return s._click_candidate_context_cache_value
+        click_coords=tuple(s._click_coord_from_action_index(idx) for idx in unique_click_indices)
+        wm_bonus_samples=None
+        if s._wm is not None:
+            wm_bonus_samples=tuple(float(s._wm[click_y, click_x]) for click_y,click_x in click_coords)
         context={}
         has_preferred=preferred_click_coord is not None and continuity_scale > 0.0
         exact_preferred_bonus=0.08 * continuity_scale
         near_preferred_bonus=0.04 * continuity_scale
         repeat_click_idx_int=None if repeat_click_idx is None else int(repeat_click_idx)
         blocked_click_idx_int=None if blocked_click_idx is None else int(blocked_click_idx)
+        repeat_click_bonus=0.08 if continuity_scale > 0.5 else -0.08
         semantic_bonus_get=semantic_click_bonus_map.get
         bfs_bonus=s._bfs_click_priority_bonus
         blocked_match=s._blocked_click_matches_coord
@@ -4084,7 +4134,7 @@ class MyAgent(Agent):
                 "bfs_bonus": bfs_bonus(click_coord),
                 "preferred_bonus": preferred_bonus,
                 "semantic_bonus": float(semantic_bonus_get(click_coord, 0.0)),
-                "repeat_bonus": 0.08 if repeat_click_idx_int is not None and idx == repeat_click_idx_int else 0.0,
+                "repeat_bonus": repeat_click_bonus if repeat_click_idx_int is not None and idx == repeat_click_idx_int else 0.0,
                 "is_blocked_idx": bool(blocked_click_idx_int is not None and idx == blocked_click_idx_int),
             }
             if wm_bonus_samples is not None:
@@ -4426,14 +4476,25 @@ class MyAgent(Agent):
             frame_hash=s._fast_frame_hash(frame)
         preferred=s._semantic_target_coord
         continuity_scale=s._semantic_continuity_scale()
-        recent_direction=s._recent_direction_action_index(frame, frame_hash=frame_hash)
-        if blocked_click_coord is None:
-            blocked_click_coord=s._blocked_click_coord(frame, frame_hash=frame_hash)
-        recent_progress_delta=s._recent_direction_progress_delta(
-            frame,
-            blocked_click_coord=blocked_click_coord,
-            frame_hash=frame_hash,
+        stateless_history=(
+            blocked_click_coord is None and
+            s.pr is None and
+            s.pai is None and
+            not s._blocked_direction_history and
+            not s._blocked_click_history
         )
+        if stateless_history:
+            recent_direction=None
+            recent_progress_delta=None
+        else:
+            recent_direction=s._recent_direction_action_index(frame, frame_hash=frame_hash)
+            if blocked_click_coord is None:
+                blocked_click_coord=s._blocked_click_coord(frame, frame_hash=frame_hash)
+            recent_progress_delta=s._recent_direction_progress_delta(
+                frame,
+                blocked_click_coord=blocked_click_coord,
+                frame_hash=frame_hash,
+            )
         cache_key=(
             frame_hash,
             None if preferred is None else (int(preferred[0]), int(preferred[1])),
@@ -4478,12 +4539,19 @@ class MyAgent(Agent):
                     continue
                 ty=float(tcenter[0]); tx=float(tcenter[1])
                 target_coord=(int(round(ty)), int(round(tx)))
-                if s._blocked_click_matches_coord(
-                        frame,
-                        target_coord,
-                        blocked_click_coord=blocked_click_coord if blocked_click_known else None,
-                        frame_hash=frame_hash):
-                    continue
+                if blocked_click_known:
+                    if s._blocked_click_matches_coord(
+                            frame,
+                            target_coord,
+                            blocked_click_coord=blocked_click_coord,
+                            frame_hash=frame_hash):
+                        continue
+                elif s._blocked_click_history:
+                    if s._blocked_click_matches_coord(
+                            frame,
+                            target_coord,
+                            frame_hash=frame_hash):
+                        continue
                 dist=abs(ty-py)+abs(tx-px)
                 if dist < 1.0:
                     continue
@@ -4545,13 +4613,23 @@ class MyAgent(Agent):
             return None
         return target_specs[0]
 
-    def _semantic_direction_action(s, frame, avail, avail_ids=None, frame_hash=None):
+    def _semantic_direction_action(s, frame, avail, avail_ids=None, frame_hash=None,
+                                   target_choice=None):
         """Choose a directional move that heads toward a likely target."""
         if avail_ids is None:
             avail_ids=s._available_action_ids(avail)
-        bonuses=s._semantic_direction_bonuses(frame, avail, avail_ids=avail_ids, frame_hash=frame_hash)
+        bonuses=s._semantic_direction_bonuses(
+            frame,
+            avail,
+            avail_ids=avail_ids,
+            frame_hash=frame_hash,
+            target_choice=target_choice,
+        )
         if not bonuses:
             return None
+        cache_key=id(bonuses)
+        if s._semantic_direction_action_cache_key == cache_key:
+            return s._semantic_direction_action_cache_value
         best_idx=None
         best_bonus=float('-inf')
         for idx,bonus in bonuses.items():
@@ -4563,8 +4641,13 @@ class MyAgent(Agent):
                 best_bonus=bonus
                 best_idx=idx
         if best_idx is None:
+            s._semantic_direction_action_cache_key=cache_key
+            s._semantic_direction_action_cache_value=None
             return None
-        return best_idx, None
+        result=(best_idx, None)
+        s._semantic_direction_action_cache_key=cache_key
+        s._semantic_direction_action_cache_value=result
+        return result
         return None
 
     def _frame_matches_previous(s, frame, frame_hash=None):
@@ -4762,7 +4845,7 @@ class MyAgent(Agent):
         return candidate_indices
 
     def _semantic_direction_bonuses(s, frame, avail=None, avail_ids=None, frame_hash=None,
-                                    avail_summary=None):
+                                    avail_summary=None, target_choice=None):
         """Soft directional preferences derived from semantic targets."""
         if avail_ids is None and avail is not None:
             avail_ids=s._available_action_ids(avail)
@@ -4770,29 +4853,44 @@ class MyAgent(Agent):
             frame_hash=s._fast_frame_hash(frame)
         if avail_summary is None and avail_ids is not None:
             avail_summary=s._availability_summary(avail_ids)
-        recent_direction=s._recent_direction_action_index(frame, frame_hash=frame_hash)
-        opposite_recent=s._opposite_direction_index(recent_direction)
-        blocked_click_coord=s._blocked_click_coord(frame, frame_hash=frame_hash)
-        blocked_direction=s._blocked_direction_action_index(frame, frame_hash=frame_hash)
-        retry_blocked_direction=s._retry_blocked_direction_after_stale_wait(
-            frame,
-            avail_ids if avail_ids is not None else (),
-            blocked_click_coord=blocked_click_coord,
-            frame_hash=frame_hash,
-            avail_summary=avail_summary,
-            blocked_direction=blocked_direction,
+        stateless_history=(
+            s.pr is None and
+            s.pai is None and
+            not s._blocked_direction_history and
+            not s._blocked_click_history
         )
-        recent_progress_delta=s._recent_direction_progress_delta(
-            frame,
-            blocked_click_coord=blocked_click_coord,
-            frame_hash=frame_hash,
-        )
+        if stateless_history:
+            recent_direction=None
+            opposite_recent=None
+            blocked_click_coord=None
+            blocked_direction=None
+            retry_blocked_direction=False
+            recent_progress_delta=None
+            preferred_axis=None
+        else:
+            recent_direction=s._recent_direction_action_index(frame, frame_hash=frame_hash)
+            opposite_recent=s._opposite_direction_index(recent_direction)
+            blocked_click_coord=s._blocked_click_coord(frame, frame_hash=frame_hash)
+            blocked_direction=s._blocked_direction_action_index(frame, frame_hash=frame_hash)
+            retry_blocked_direction=s._retry_blocked_direction_after_stale_wait(
+                frame,
+                avail_ids if avail_ids is not None else (),
+                blocked_click_coord=blocked_click_coord,
+                frame_hash=frame_hash,
+                avail_summary=avail_summary,
+                blocked_direction=blocked_direction,
+            )
+            recent_progress_delta=s._recent_direction_progress_delta(
+                frame,
+                blocked_click_coord=blocked_click_coord,
+                frame_hash=frame_hash,
+            )
+            preferred_axis=s._recent_direction_axis(frame, frame_hash=frame_hash)
         legal_dirs=None
         if avail_summary is not None:
             legal_dirs=avail_summary["legal_dirs"]
             if not legal_dirs:
                 return {}
-        preferred_axis=s._recent_direction_axis(frame, frame_hash=frame_hash)
         cache_key=(
             int(frame_hash),
             tuple(avail_ids) if avail_ids is not None else None,
@@ -4809,10 +4907,8 @@ class MyAgent(Agent):
         if s._semantic_direction_bonuses_cache_key == cache_key:
             return s._semantic_direction_bonuses_cache_value
         fallback_bonuses=None
-        for choice in s._semantic_target_candidates(
-                frame,
-                blocked_click_coord=blocked_click_coord,
-                frame_hash=frame_hash):
+
+        def _bonuses_for_choice(choice):
             py=choice['player_y']; px=choice['player_x']
             ty=choice['target_y']; tx=choice['target_x']
             dy=ty-py
@@ -4845,31 +4941,57 @@ class MyAgent(Agent):
                     continue
                 if idx not in bonuses:
                     bonuses[idx]=bonus
-            if bonuses:
+            if not bonuses:
+                return None
+            if (not retry_blocked_direction and
+                    (blocked_direction is not None or s._blocked_direction_history)):
                 for blocked_idx in range(4):
-                    if (not retry_blocked_direction and
-                            s._direction_matches_blocked_history(
-                                blocked_idx,
-                                frame,
-                                frame_hash=frame_hash,
-                                blocked_direction=blocked_direction)):
+                    if s._direction_matches_blocked_history(
+                            blocked_idx,
+                            frame,
+                            frame_hash=frame_hash,
+                            blocked_direction=blocked_direction):
                         if blocked_idx in bonuses:
                             bonuses[blocked_idx] = min(bonuses[blocked_idx], -0.12)
                         else:
                             bonuses[blocked_idx] = -0.12
-                if (opposite_recent is not None and
-                        opposite_recent in bonuses and
-                        len(bonuses) > 1 and
-                        (recent_progress_delta is None or recent_progress_delta >= -0.5)):
-                    bonuses[opposite_recent] -= 0.30
+            if (opposite_recent is not None and
+                    opposite_recent in bonuses and
+                    len(bonuses) > 1 and
+                    (recent_progress_delta is None or recent_progress_delta >= -0.5)):
+                bonuses[opposite_recent] -= 0.30
+            return bonuses
+
+        seen_primary_choice=False
+        if target_choice is not None:
+            bonuses=_bonuses_for_choice(target_choice)
+            if bonuses is not None:
                 if any(float(bonus) > 0.0 for bonus in bonuses.values()):
                     s._semantic_direction_bonuses_cache_key=cache_key
                     s._semantic_direction_bonuses_cache_value=bonuses
                     return bonuses
-                if (fallback_bonuses is None or
-                        max(float(bonus) for bonus in bonuses.values()) >
-                        max(float(bonus) for bonus in fallback_bonuses.values())):
-                    fallback_bonuses=bonuses
+                fallback_bonuses=bonuses
+            seen_primary_choice=True
+        for choice in s._semantic_target_candidates(
+                frame,
+                blocked_click_coord=blocked_click_coord,
+                frame_hash=frame_hash):
+            if (seen_primary_choice and
+                    choice.get('score_key') == target_choice.get('score_key') and
+                    choice.get('target_y') == target_choice.get('target_y') and
+                    choice.get('target_x') == target_choice.get('target_x')):
+                continue
+            bonuses=_bonuses_for_choice(choice)
+            if bonuses is None:
+                continue
+            if any(float(bonus) > 0.0 for bonus in bonuses.values()):
+                s._semantic_direction_bonuses_cache_key=cache_key
+                s._semantic_direction_bonuses_cache_value=bonuses
+                return bonuses
+            if (fallback_bonuses is None or
+                    max(float(bonus) for bonus in bonuses.values()) >
+                    max(float(bonus) for bonus in fallback_bonuses.values())):
+                fallback_bonuses=bonuses
         result=fallback_bonuses or {}
         s._semantic_direction_bonuses_cache_key=cache_key
         s._semantic_direction_bonuses_cache_value=result
@@ -5141,6 +5263,13 @@ class MyAgent(Agent):
         if avail_summary is None:
             avail_summary=s._availability_summary(avail_ids)
         av=avail_summary["legal_dirs"]
+        target_choice=None
+        if avail_summary["has_click"]:
+            target_choice=s._semantic_target_choice(
+                frame,
+                blocked_click_coord=blocked_click_coord,
+                frame_hash=frame_hash,
+            )
         direct_click_choice=(
             s._semantic_direct_click_choice(
                 frame,
@@ -5148,12 +5277,19 @@ class MyAgent(Agent):
                 avail_ids=avail_ids,
                 blocked_click_coord=blocked_click_coord,
                 frame_hash=frame_hash,
+                target_choice=target_choice,
             )
             if avail_summary["has_click"] else None
         )
         if direct_click_choice is not None:
             return direct_click_choice
-        semantic_dir=s._semantic_direction_action(frame, avail, avail_ids=avail_ids, frame_hash=frame_hash)
+        semantic_dir=s._semantic_direction_action(
+            frame,
+            avail,
+            avail_ids=avail_ids,
+            frame_hash=frame_hash,
+            target_choice=target_choice,
+        )
         if semantic_dir is not None:
             return semantic_dir
         blocked_direction=s._blocked_direction_action_index(frame, frame_hash=frame_hash)

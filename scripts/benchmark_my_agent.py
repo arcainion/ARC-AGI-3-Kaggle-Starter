@@ -217,6 +217,7 @@ def run_benchmarks(iterations=200, warmup=20):
         blocked_click_coord=blocked_click_coord,
         frame_hash=frame_hash,
     )
+    tensor = agent._encode_frame_tensor(frame)
     click_scale = agent._semantic_click_bonus_scale(
         frame,
         blocked_click_coord=blocked_click_coord,
@@ -322,6 +323,55 @@ def run_benchmarks(iterations=200, warmup=20):
     stale_wait_frame_hash = stale_wait_agent._fast_frame_hash(stale_wait_frame)
     stale_wait_avail_ids = [2, 4, 5]
     stale_wait_avail_summary = stale_wait_agent._availability_summary(stale_wait_avail_ids)
+
+    warmup_agent = make_agent()
+    warmup_agent._semantic_detector = fake_detector
+    warmup_agent._semantic_target_coord = (22, 38)
+    warmup_agent._unproductive = 0
+    warmup_agent.la = 0
+    warmup_agent._maybe_train = lambda *args, **kwargs: None
+    warmup_frame_hash = warmup_agent._fast_frame_hash(frame)
+
+    refresh_agent = make_agent()
+    refresh_agent._semantic_detector = fake_detector
+    refresh_agent._semantic_target_coord = None
+    refresh_frame_hash = refresh_agent._fast_frame_hash(frame)
+    refresh_blocked_click_coord = refresh_agent._blocked_click_coord(frame, frame_hash=refresh_frame_hash)
+    refresh_target_choice = refresh_agent._semantic_target_choice(
+        frame,
+        blocked_click_coord=refresh_blocked_click_coord,
+        frame_hash=refresh_frame_hash,
+    )
+    refresh_fallback_agent = make_agent()
+    refresh_fallback_frame_hash = refresh_fallback_agent._fast_frame_hash(frame)
+    refresh_fallback_agent._semantic_target_choice = lambda *args, **kwargs: None
+
+    control_agent = make_agent()
+    control_frame_hash = control_agent._fast_frame_hash(frame)
+    control_tensor = control_agent._encode_frame_tensor(frame)
+    control_agent._undo_avail = True
+    control_agent._ckpt_hash = 1
+    control_agent._unproductive = 31
+    control_agent.pr = frame.copy()
+    control_agent.ph = control_frame_hash
+    control_agent.fhist.append(frame.copy())
+
+    revisit_agent = make_agent()
+    revisit_curr_hash = revisit_agent._fast_frame_hash(frame)
+    revisit_prev_frame = frame.copy()
+    revisit_prev_frame[0, 0] = 3
+    revisit_prev_hash = revisit_agent._fast_frame_hash(revisit_prev_frame)
+    revisit_agent.fhist.append(revisit_prev_frame.copy())
+    revisit_agent.fhist.append(frame.copy())
+
+    policy_agent = make_agent()
+    policy_agent._semantic_detector = fake_detector
+    policy_agent._semantic_target_coord = (22, 38)
+    policy_agent._eps = 0.0
+    policy_frame_hash = policy_agent._fast_frame_hash(frame)
+    policy_avail_ids = policy_agent._available_action_ids(avail)
+    policy_blocked_click_coord = policy_agent._blocked_click_coord(frame, frame_hash=policy_frame_hash)
+    policy_tensor = policy_agent._encode_frame_tensor(frame)
 
     results = []
     results.append(benchmark_case(
@@ -601,6 +651,15 @@ def run_benchmarks(iterations=200, warmup=20):
         warmup,
     ))
     results.append(benchmark_case(
+        "blocked_click_coord",
+        lambda: agent._blocked_click_coord(
+            frame,
+            frame_hash=frame_hash,
+        ),
+        iterations,
+        warmup,
+    ))
+    results.append(benchmark_case(
         "frame_matches_previous",
         lambda: blocked_direction_agent._frame_matches_previous(
             blocked_direction_frame,
@@ -664,6 +723,18 @@ def run_benchmarks(iterations=200, warmup=20):
         warmup,
     ))
     results.append(benchmark_case(
+        "preferred_direction_choice",
+        lambda: agent._preferred_direction_choice(1, None, [2, 4, 6]),
+        iterations,
+        warmup,
+    ))
+    results.append(benchmark_case(
+        "preferred_click_target_choice",
+        lambda: agent._preferred_click_target_choice(click_targets, preferred_click_coord, 6),
+        iterations,
+        warmup,
+    ))
+    results.append(benchmark_case(
         "click_candidate_context_map",
         lambda: agent._click_candidate_context_map(
             frame,
@@ -676,6 +747,12 @@ def run_benchmarks(iterations=200, warmup=20):
             blocked_click_idx=blocked_click_idx,
             continuity_scale=continuity_scale,
         ),
+        iterations,
+        warmup,
+    ))
+    results.append(benchmark_case(
+        "recent_frame_revisit_penalty",
+        lambda: revisit_agent._recent_frame_revisit_penalty(revisit_curr_hash, revisit_prev_hash),
         iterations,
         warmup,
     ))
@@ -758,6 +835,96 @@ def run_benchmarks(iterations=200, warmup=20):
             blocked_click_coord=None,
             frame_hash=stale_wait_frame_hash,
             avail_summary=stale_wait_avail_summary,
+        ),
+        iterations,
+        warmup,
+    ))
+    results.append(benchmark_case(
+        "semantic_direction_action",
+        lambda: agent._semantic_direction_action(
+            frame,
+            avail,
+            avail_ids=avail_ids,
+            frame_hash=frame_hash,
+        ),
+        iterations,
+        warmup,
+    ))
+    results.append(benchmark_case(
+        "heuristic_action",
+        lambda: agent._heuristic(
+            frame,
+            avail,
+            6,
+            blocked_click_coord=blocked_click_coord,
+            avail_ids=avail_ids,
+            frame_hash=frame_hash,
+            avail_summary=avail_summary,
+        ),
+        iterations,
+        warmup,
+    ))
+    results.append(benchmark_case(
+        "prime_warmup_action",
+        lambda: warmup_agent._prime_warmup_action(
+            frame,
+            avail,
+            frame_hash=warmup_frame_hash,
+        ),
+        iterations,
+        warmup,
+    ))
+    results.append(benchmark_case(
+        "refresh_semantic_target_coord_choice",
+        lambda: refresh_agent._refresh_semantic_target_coord(
+            frame,
+            blocked_click_coord=refresh_blocked_click_coord,
+            frame_hash=refresh_frame_hash,
+            target_choice=refresh_target_choice,
+        ),
+        iterations,
+        warmup,
+    ))
+    results.append(benchmark_case(
+        "refresh_semantic_target_coord_fallback",
+        lambda: refresh_fallback_agent._refresh_semantic_target_coord(
+            frame,
+            fallback_coord=(22, 38),
+            blocked_click_coord=None,
+            frame_hash=refresh_fallback_frame_hash,
+        ),
+        iterations,
+        warmup,
+    ))
+    results.append(benchmark_case(
+        "handle_non_modeled_availability",
+        lambda: control_agent._handle_non_modeled_availability(
+            control_tensor,
+            frame,
+            control_frame_hash,
+        ),
+        iterations,
+        warmup,
+    ))
+    results.append(benchmark_case(
+        "maybe_force_undo",
+        lambda: control_agent._maybe_force_undo(
+            control_tensor,
+            frame,
+            control_frame_hash,
+        ),
+        iterations,
+        warmup,
+    ))
+    results.append(benchmark_case(
+        "choose_policy_action_heuristic_path",
+        lambda: policy_agent._choose_policy_action(
+            policy_tensor,
+            frame,
+            avail,
+            policy_avail_ids,
+            policy_blocked_click_coord,
+            frame_hash=policy_frame_hash,
         ),
         iterations,
         warmup,
