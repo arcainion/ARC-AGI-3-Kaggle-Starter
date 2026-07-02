@@ -11,6 +11,27 @@ a single command.
 No Docker. No `submission.json` to hand-write. No copy-pasting between your
 editor and a notebook.
 
+### Hyperon symbolic mode
+
+The symbolic backend stays opt-in during the cutover. Enable it with
+`ARC_SYMBOLIC_ENABLED=1`.
+
+Optional runtime controls:
+
+- `ARC_SYMBOLIC_FORCE=1` forces the symbolic path even when the Hyperon runtime is only partially available and the backend must rely on its local summary mirror.
+- `ARC_SYMBOLIC_FALLBACK_MODE=symbolic_then_bfs` keeps BFS as the first recovery path when symbolic ranking produces no useful legal action.
+- `ARC_SYMBOLIC_KEEP_SUMMARY=0` clears cross-level symbolic summary stats on level changes.
+- `ARC_SYMBOLIC_VERBOSE=1` logs backend name plus Hyperon atom and transition counts during symbolic action selection.
+
+Offline symbolic corpus preparation now uses:
+
+```bash
+.venv/bin/python scripts/train_offline_from_zip.py --mode symbolic --output hyperon_bootstrap.jsonl
+```
+
+That output now contains Hyperon bootstrap atoms suitable for preloading the
+symbolic backend, not neural weights.
+
 ---
 
 ## What you need before you start
@@ -40,6 +61,7 @@ mkdir -p .kaggle && echo "KGAT_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" > .kaggle/acces
 chmod 600 .kaggle/access_token
 
 # 3.  One-time setup: venv, dependencies, framework
+#     This installs `hyperon` for the optional symbolic backend.
 make setup
 
 # 4.  Open agent/my_agent.py to see the random-action starter, then edit
@@ -68,7 +90,8 @@ step 8 is the deliberate moment when you spend a daily submission.
 ## The one file you edit: `agent/my_agent.py`
 
 This is the only file you normally touch. It defines a class called `MyAgent`
-with two methods:
+and preserves the same external runtime contract while adding an opt-in
+`hyperon`-backed symbolic decision path:
 
 ```python
 class MyAgent(Agent):

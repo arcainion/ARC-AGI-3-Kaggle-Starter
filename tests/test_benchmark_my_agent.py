@@ -89,6 +89,8 @@ class BenchmarkMyAgentTests(unittest.TestCase):
         self.assertIn("sample_semantic_exploration_sparse", names)
         self.assertIn("engine_action_input_plain", names)
         self.assertIn("make_replay_game_and_frame", names)
+        self.assertIn("bfs_warm_fallthrough", names)
+        self.assertIn("hyperon_extract_and_rank", names)
         self.assertTrue(all(item["iterations"] >= 1 for item in results))
 
 

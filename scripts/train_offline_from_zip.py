@@ -382,6 +382,102 @@ def iter_training_samples(
         yield frame, action_target, member_name
 
 
+def _frame_symbolic_summary(frame: np.ndarray) -> dict[str, object]:
+    frame = np.ascontiguousarray(frame, dtype=np.uint8)
+    counts = np.bincount(frame.ravel(), minlength=16)
+    background = int(counts.argmax()) if counts.size else 0
+    palette = [int(value) for value in np.unique(frame).tolist() if int(value) != background][:8]
+    edge = np.zeros((64, 64), dtype=bool)
+    edge[1:, :] |= frame[1:, :] != frame[:-1, :]
+    edge[:-1, :] |= frame[:-1, :] != frame[1:, :]
+    edge[:, 1:] |= frame[:, 1:] != frame[:, :-1]
+    edge[:, :-1] |= frame[:, :-1] != frame[:, 1:]
+    return {
+        "background": background,
+        "palette": palette,
+        "non_background_pixels": int(np.count_nonzero(frame != background)),
+        "edge_pixels": int(np.count_nonzero(edge)),
+        "frame_hash": int(hash(frame.tobytes())),
+    }
+
+
+def _hyperon_bootstrap_record(
+    frame: np.ndarray,
+    *,
+    action_target: int,
+    sample_weight: float,
+    member_name: str,
+) -> dict[str, object]:
+    symbolic_state = _frame_symbolic_summary(frame)
+    frame_hash = int(symbolic_state["frame_hash"])
+    state_atom = f"(state offline {frame_hash})"
+    action_atom = f"(observed-action {frame_hash} {int(action_target)})"
+    return {
+        "member_name": member_name,
+        "action_target": int(action_target),
+        "sample_weight": float(sample_weight),
+        "symbolic_state": symbolic_state,
+        "hyperon_bootstrap": {
+            "atoms": [
+                state_atom,
+                f"(background {frame_hash} {int(symbolic_state['background'])})",
+                action_atom,
+                f"(sample-weight {frame_hash} {float(sample_weight):.6f})",
+            ] + [
+                f"(palette {frame_hash} {int(color)})" for color in symbolic_state["palette"]
+            ],
+        },
+    }
+
+
+class HyperonCorpusBuilder:
+    """Build a lightweight Hyperon bootstrap corpus for symbolic agents."""
+
+    def build_from_zip(
+        self,
+        zip_path: Path,
+        output_path: Path,
+        *,
+        max_recordings: int | None = None,
+        max_samples: int | None = None,
+    ) -> dict[str, int]:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        samples = 0
+        skipped_unsupported = 0
+        skipped_malformed = 0
+        filtered_noisy = 0
+        with output_path.open("w", encoding="utf-8") as handle:
+            for event in iter_training_events(
+                zip_path,
+                max_recordings=max_recordings,
+                max_samples=max_samples,
+            ):
+                if event[0] is None:
+                    _, classification, _member_name = event
+                    if classification == "unsupported":
+                        skipped_unsupported += 1
+                    elif classification == "filtered_noisy":
+                        filtered_noisy += 1
+                    else:
+                        skipped_malformed += 1
+                    continue
+                frame, action_target, sample_weight, member_name = event
+                payload = _hyperon_bootstrap_record(
+                    frame,
+                    action_target=int(action_target),
+                    sample_weight=float(sample_weight),
+                    member_name=member_name,
+                )
+                handle.write(json.dumps(payload, sort_keys=True) + "\n")
+                samples += 1
+        return {
+            "samples": samples,
+            "skipped_unsupported": skipped_unsupported,
+            "skipped_malformed": skipped_malformed,
+            "filtered_noisy": filtered_noisy,
+        }
+
+
 def load_agent_components():
     from agent.my_agent import ForgeNet, MyAgent
 
@@ -959,8 +1055,14 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument(
         "--output",
         type=Path,
-        default=ROOT / "pretrained_weights_offline.pt",
-        help="Where to save the trained weights.",
+        default=ROOT / "hyperon_bootstrap.jsonl",
+        help="Where to save the Hyperon bootstrap corpus or trained weights.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("auto", "symbolic", "neural"),
+        default="auto",
+        help="`symbolic` builds a Hyperon bootstrap corpus; `neural` runs the legacy behavior-cloning trainer; `auto` picks symbolic mode for non-weight outputs.",
     )
     parser.add_argument(
         "--init-weights",
@@ -1011,6 +1113,28 @@ def main(argv: list[str] | None = None) -> int:
     random.seed(args.seed)
     np.random.seed(args.seed % (2**32 - 1))
     torch.manual_seed(args.seed % (2**32 - 1))
+
+    selected_mode = args.mode
+    if selected_mode == "auto":
+        selected_mode = "neural" if args.output.suffix.lower() in {".pt", ".pth"} else "symbolic"
+
+    if selected_mode == "symbolic":
+        builder = HyperonCorpusBuilder()
+        stats = builder.build_from_zip(
+            args.zip_path,
+            args.output,
+            max_recordings=args.max_recordings,
+            max_samples=args.max_samples,
+        )
+        logger.info(
+            "saved Hyperon bootstrap corpus %s with %s samples, %s skipped unsupported actions, %s skipped malformed actions, %s filtered noisy actions",
+            args.output,
+            stats["samples"],
+            stats["skipped_unsupported"],
+            stats["skipped_malformed"],
+            stats["filtered_noisy"],
+        )
+        return 0
 
     device = resolve_device(args.device)
     logger.info("device=%s", device)

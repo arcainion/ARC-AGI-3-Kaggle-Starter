@@ -208,6 +208,34 @@ class TrainOfflineFromZipTests(unittest.TestCase):
             self.assertTrue(np.all(samples[0][0] == 1))
             self.assertTrue(np.all(samples[1][0] == 2))
 
+    def test_hyperon_corpus_builder_writes_symbolic_bootstrap_records(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            zip_path = Path(tmp_dir) / "demo.zip"
+            output_path = Path(tmp_dir) / "hyperon_bootstrap.jsonl"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr(
+                    "public/demo.recording.jsonl",
+                    "\n".join(
+                        [
+                            _recording_line(1, 0),
+                            _recording_line(2, "ACTION2"),
+                        ]
+                    ),
+                )
+
+            builder = self.module.HyperonCorpusBuilder()
+            stats = builder.build_from_zip(zip_path, output_path)
+
+            self.assertEqual(stats["samples"], 1)
+            lines = output_path.read_text(encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(lines), 1)
+            payload = json.loads(lines[0])
+            self.assertEqual(payload["action_target"], 1)
+            self.assertIn("symbolic_state", payload)
+            self.assertIn("hyperon_bootstrap", payload)
+            self.assertGreaterEqual(len(payload["hyperon_bootstrap"]["atoms"]), 4)
+            self.assertTrue(any(atom.startswith("(observed-action ") for atom in payload["hyperon_bootstrap"]["atoms"]))
+
     def test_iter_training_samples_marks_unsupported_actions(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             zip_path = Path(tmp_dir) / "demo.zip"

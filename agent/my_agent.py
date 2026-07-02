@@ -35,11 +35,13 @@ import copy
 import bisect
 from concurrent.futures import ThreadPoolExecutor
 import gc
+import importlib.metadata
 import math
 import pickle
 from contextlib import contextmanager, nullcontext
 import glob
 import hashlib
+import json
 import zlib
 import importlib.util
 import logging
@@ -52,6 +54,20 @@ from array import array
 from itertools import islice
 
 import numpy as np
+try:
+    import hyperon as _hyperon
+    from hyperon import E as _hyperon_expr
+    from hyperon import GroundingSpace as _HyperonGroundingSpace
+    from hyperon import S as _hyperon_symbol
+    from hyperon import V as _hyperon_variable
+    _HYPERON_IMPORT_ERROR = None
+except Exception as exc:
+    _hyperon = None
+    _hyperon_expr = None
+    _HyperonGroundingSpace = None
+    _hyperon_symbol = None
+    _hyperon_variable = None
+    _HYPERON_IMPORT_ERROR = exc
 
 import torch
 import torch.nn as nn
@@ -108,6 +124,493 @@ def _frame_signature(frame):
         zlib.crc32(data) & 0xffffffff,
         zlib.adler32(data) & 0xffffffff,
     )
+
+
+class _HyperonBackend:
+    """Hyperon-backed symbolic memory with a local stats mirror for fallback."""
+
+    def __init__(self):
+        self.package_version = None
+        self.import_error = _HYPERON_IMPORT_ERROR
+        self.available = False
+        self.backend_name = "hyperon-unavailable"
+        self.instance = None
+        self._states = {}
+        self._context_action_stats = {}
+        self._global_action_stats = {}
+        self.level_idx = -1
+        self._transition_count = 0
+        self._context_token_cache = {}
+        self._symbol_cache = {}
+        self._action_token_cache = {}
+        self._score_cache = {}
+        self._stats_revision = 0
+        self._query_var_prev = None
+        self._query_var_curr = None
+        self._query_var_reward = None
+        self._query_var_outcome = None
+        if _hyperon is None or _HyperonGroundingSpace is None:
+            return
+        try:
+            self.package_version = importlib.metadata.version("hyperon")
+        except importlib.metadata.PackageNotFoundError:
+            self.package_version = None
+        try:
+            self.instance = _HyperonGroundingSpace()
+            self.available = True
+            self.backend_name = f"hyperon@{self.package_version}" if self.package_version else "hyperon"
+            self._query_var_prev = self._space_var("PREV")
+            self._query_var_curr = self._space_var("CURR")
+            self._query_var_reward = self._space_var("REWARD")
+            self._query_var_outcome = self._space_var("OUTCOME")
+        except Exception as exc:
+            self.import_error = exc
+            self.instance = None
+            self.available = False
+            self.backend_name = "hyperon-init-error"
+
+    def _state_node_id(self, level_idx, frame_hash):
+        return f"state:{int(level_idx)}:{int(frame_hash)}"
+
+    def _action_node_id(self, action_key):
+        action_idx, coords = action_key
+        if coords is None:
+            return f"action:{int(action_idx)}"
+        return f"action:{int(action_idx)}:{int(coords[0])}:{int(coords[1])}"
+
+    def _context_token(self, context_key):
+        cached = self._context_token_cache.get(context_key)
+        if cached is not None:
+            return cached
+        token = hashlib.sha1(repr(context_key).encode("utf-8")).hexdigest()[:16]
+        self._context_token_cache[context_key] = token
+        return token
+
+    def _space_symbol(self, value):
+        key = str(value)
+        cached = self._symbol_cache.get(key)
+        if cached is not None:
+            return cached
+        symbol = _hyperon_symbol(key)
+        self._symbol_cache[key] = symbol
+        return symbol
+
+    def _space_expr(self, *parts):
+        return _hyperon_expr(*parts)
+
+    def _space_var(self, name):
+        return _hyperon_variable(str(name))
+
+    def _space_add(self, atom):
+        if self.instance is None:
+            return
+        try:
+            self.instance.add(atom)
+        except Exception as exc:
+            self.import_error = exc
+
+    def _atom_reward(self, value):
+        return f"{float(value):.6f}"
+
+    def _atom_bool(self, value):
+        return "1" if value else "0"
+
+    def _query_bindings(self, atom):
+        if self.instance is None:
+            return []
+        try:
+            return list(self.instance.query(atom))
+        except Exception as exc:
+            self.import_error = exc
+            return []
+
+    def _score_from_bindings(self, bindings):
+        if not bindings:
+            return None
+        reward_sum = 0.0
+        changed_count = 0
+        count = 0
+        for binding in bindings:
+            try:
+                reward_sum += float(str(binding["REWARD"]))
+            except Exception:
+                continue
+            changed_count += 1 if str(binding.get("OUTCOME", "0")) == "1" else 0
+            count += 1
+        if count <= 0:
+            return None
+        return {
+            "count": count,
+            "reward_sum": reward_sum,
+            "changed_count": changed_count,
+        }
+
+    def reset_level(self, level_idx, *, keep_summary=True):
+        self.level_idx = int(level_idx)
+        self._states[int(level_idx)] = {}
+        self._transition_count = 0
+        self._score_cache.clear()
+        if not keep_summary:
+            self._context_action_stats.clear()
+            self._global_action_stats.clear()
+            self._stats_revision += 1
+        if self.available and _HyperonGroundingSpace is not None:
+            try:
+                self.instance = _HyperonGroundingSpace()
+                self._query_var_prev = self._space_var("PREV")
+                self._query_var_curr = self._space_var("CURR")
+                self._query_var_reward = self._space_var("REWARD")
+                self._query_var_outcome = self._space_var("OUTCOME")
+            except Exception as exc:
+                self.import_error = exc
+                self.instance = None
+                self.available = False
+                self.backend_name = "hyperon-init-error"
+        if self.instance is None:
+            return
+        self._space_add(self._space_expr(self._space_symbol("level"), self._space_symbol(int(level_idx))))
+
+    def upsert_state(self, level_idx, frame_hash, facts):
+        level_idx = int(level_idx)
+        frame_hash = int(frame_hash)
+        copied_facts = dict(facts)
+        self._states.setdefault(level_idx, {})[frame_hash] = copied_facts
+        if self.instance is None:
+            return
+        state_node = self._state_node_id(level_idx, frame_hash)
+        self._space_add(self._space_expr(self._space_symbol("state"), self._space_symbol(level_idx), self._space_symbol(state_node)))
+        self._space_add(self._space_expr(self._space_symbol("background"), self._space_symbol(state_node), self._space_symbol(int(copied_facts.get("background", 0)))))
+        self._space_add(self._space_expr(self._space_symbol("component-count"), self._space_symbol(state_node), self._space_symbol(int(copied_facts.get("component_count", 0)))))
+        self._space_add(self._space_expr(self._space_symbol("repeated-state"), self._space_symbol(state_node), self._space_symbol(self._atom_bool(bool(copied_facts.get("repeated_state", False))))))
+        for action_id in copied_facts.get("available_actions", ()):
+            self._space_add(self._space_expr(self._space_symbol("available-action"), self._space_symbol(state_node), self._space_symbol(int(action_id))))
+        if copied_facts.get("blocked_direction_index") is not None:
+            self._space_add(self._space_expr(self._space_symbol("blocked-direction"), self._space_symbol(state_node), self._space_symbol(int(copied_facts["blocked_direction_index"]))))
+        blocked_click_coord = copied_facts.get("blocked_click_coord")
+        if blocked_click_coord is not None:
+            self._space_add(
+                self._space_expr(
+                    self._space_symbol("blocked-click"),
+                    self._space_symbol(state_node),
+                    self._space_symbol(int(blocked_click_coord[0])),
+                    self._space_symbol(int(blocked_click_coord[1])),
+                )
+            )
+        for palette_value in copied_facts.get("palette", ()):
+            self._space_add(self._space_expr(self._space_symbol("palette"), self._space_symbol(state_node), self._space_symbol(int(palette_value))))
+        for idx, component in enumerate(copied_facts.get("components", ())):
+            y0, x0, y1, x1 = component.get("bbox", (0, 0, 0, 0))
+            cy, cx = component.get("center", (0.0, 0.0))
+            self._space_add(
+                self._space_expr(
+                    self._space_symbol("component"),
+                    self._space_symbol(state_node),
+                    self._space_symbol(int(idx)),
+                    self._space_symbol(int(component.get("color", 0))),
+                    self._space_symbol(int(component.get("area", 0))),
+                    self._space_symbol(int(y0)),
+                    self._space_symbol(int(x0)),
+                    self._space_symbol(int(y1)),
+                    self._space_symbol(int(x1)),
+                    self._space_symbol(f"{float(cy):.3f}"),
+                    self._space_symbol(f"{float(cx):.3f}"),
+                    self._space_symbol(self._atom_bool(bool(component.get("touches_edge", False)))),
+                )
+            )
+        for relation in copied_facts.get("relations", ()):
+            self._space_add(
+                self._space_expr(
+                    self._space_symbol("relation"),
+                    self._space_symbol(state_node),
+                    self._space_symbol(int(relation.get("src_color", 0))),
+                    self._space_symbol(int(relation.get("dst_color", 0))),
+                    self._space_symbol(str(relation.get("relation", "related_to"))),
+                    self._space_symbol(f"{float(relation.get('distance', 0.0)):.3f}"),
+                )
+            )
+
+    def remember_transition(self, *, level_idx, prev_hash, curr_hash, context_key, action_key, reward, changed):
+        level_idx = int(level_idx)
+        context_bucket = self._context_action_stats.setdefault((level_idx, context_key, action_key), {
+            "count": 0,
+            "reward_sum": 0.0,
+            "changed_count": 0,
+        })
+        context_bucket["count"] += 1
+        context_bucket["reward_sum"] += float(reward)
+        context_bucket["changed_count"] += 1 if changed else 0
+
+        global_bucket = self._global_action_stats.setdefault(action_key, {
+            "count": 0,
+            "reward_sum": 0.0,
+            "changed_count": 0,
+        })
+        global_bucket["count"] += 1
+        global_bucket["reward_sum"] += float(reward)
+        global_bucket["changed_count"] += 1 if changed else 0
+        self._stats_revision += 1
+        self._score_cache.clear()
+        if prev_hash is None or self.instance is None:
+            return
+        self._transition_count += 1
+        context_token = self._context_token(context_key)
+        action_token = self._action_node_id(action_key)
+        outcome_token = self._atom_bool(bool(changed))
+        reward_token = self._atom_reward(reward)
+        self._space_add(
+            self._space_expr(
+                self._space_symbol("transition"),
+                self._space_symbol(level_idx),
+                self._space_symbol(context_token),
+                self._space_symbol(action_token),
+                self._space_symbol(self._state_node_id(level_idx, prev_hash)),
+                self._space_symbol(self._state_node_id(level_idx, curr_hash)),
+                self._space_symbol(reward_token),
+                self._space_symbol(outcome_token),
+            )
+        )
+        self._space_add(
+            self._space_expr(
+                self._space_symbol("global-transition"),
+                self._space_symbol(action_token),
+                self._space_symbol(reward_token),
+                self._space_symbol(outcome_token),
+            )
+        )
+
+    def score_action(self, *, level_idx, context_key, action_key):
+        if self._transition_count == 0 and not self._context_action_stats and not self._global_action_stats:
+            return 0.0
+        cache_key = (int(level_idx), context_key, action_key, self._stats_revision)
+        cached = self._score_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        score = 0.0
+        context_bucket = None
+        global_bucket = None
+        if self.instance is not None:
+            context_token = self._context_token(context_key)
+            action_token = self._action_token_cache.get(action_key)
+            if action_token is None:
+                action_token = self._action_node_id(action_key)
+                self._action_token_cache[action_key] = action_token
+            context_bindings = self._query_bindings(
+                self._space_expr(
+                    self._space_symbol("transition"),
+                    self._space_symbol(int(level_idx)),
+                    self._space_symbol(context_token),
+                    self._space_symbol(action_token),
+                    self._query_var_prev,
+                    self._query_var_curr,
+                    self._query_var_reward,
+                    self._query_var_outcome,
+                )
+            )
+            global_bindings = self._query_bindings(
+                self._space_expr(
+                    self._space_symbol("global-transition"),
+                    self._space_symbol(action_token),
+                    self._query_var_reward,
+                    self._query_var_outcome,
+                )
+            )
+            context_bucket = self._score_from_bindings(context_bindings)
+            global_bucket = self._score_from_bindings(global_bindings)
+        if context_bucket is None:
+            context_bucket = self._context_action_stats.get((int(level_idx), context_key, action_key))
+        if context_bucket and context_bucket["count"] > 0:
+            score += context_bucket["reward_sum"] / float(context_bucket["count"])
+            score += 0.75 * (context_bucket["changed_count"] / float(context_bucket["count"]))
+        if global_bucket is None:
+            global_bucket = self._global_action_stats.get(action_key)
+        if global_bucket and global_bucket["count"] > 0:
+            score += 0.5 * (global_bucket["reward_sum"] / float(global_bucket["count"]))
+            score += 0.25 * (global_bucket["changed_count"] / float(global_bucket["count"]))
+        final_score = float(score)
+        self._score_cache[cache_key] = final_score
+        return final_score
+
+    def space_stats(self):
+        return {
+            "backend_name": self.backend_name,
+            "level_idx": int(self.level_idx),
+            "atom_count": int(self.instance.atom_count()) if self.instance is not None else 0,
+            "transition_count": int(self._transition_count),
+            "state_count": int(sum(1 for _level_states in self._states.values() for _ in _level_states)),
+        }
+
+
+class _HyperonAgentCore:
+    """Symbolic state extraction + Hyperon-backed action ranking."""
+
+    def __init__(self):
+        self.backend = _HyperonBackend()
+        self.level_idx = -1
+        self._extract_facts_cache = {}
+
+    def reset_level(self, level_idx, *, keep_summary=True):
+        self.level_idx = int(level_idx)
+        self._extract_facts_cache.clear()
+        self.backend.reset_level(level_idx, keep_summary=keep_summary)
+
+    def _background(self, frame):
+        counts = np.bincount(np.asarray(frame, dtype=np.uint8).ravel(), minlength=16)
+        return int(counts.argmax()) if counts.size else 0
+
+    def _component_facts(self, frame, bg):
+        frame = np.asarray(frame, dtype=np.uint8)
+        seen = np.zeros(frame.shape, dtype=bool)
+        components = []
+        h, w = frame.shape
+        for y in range(h):
+            for x in range(w):
+                color = int(frame[y, x])
+                if seen[y, x] or color == bg:
+                    continue
+                stack = [(y, x)]
+                seen[y, x] = True
+                cells = []
+                while stack:
+                    cy, cx = stack.pop()
+                    cells.append((cy, cx))
+                    for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                        if 0 <= ny < h and 0 <= nx < w and not seen[ny, nx] and int(frame[ny, nx]) == color:
+                            seen[ny, nx] = True
+                            stack.append((ny, nx))
+                ys = [cell[0] for cell in cells]
+                xs = [cell[1] for cell in cells]
+                y0, y1 = min(ys), max(ys)
+                x0, x1 = min(xs), max(xs)
+                components.append({
+                    "color": color,
+                    "area": len(cells),
+                    "bbox": (y0, x0, y1, x1),
+                    "center": (float(sum(ys)) / len(ys), float(sum(xs)) / len(xs)),
+                    "touches_edge": bool(y0 == 0 or x0 == 0 or y1 == h - 1 or x1 == w - 1),
+                })
+        components.sort(key=lambda comp: (-int(comp["area"]), int(comp["color"])))
+        return components[:24]
+
+    def _spatial_relations(self, components):
+        relations = []
+        limited = components[:8]
+        for idx, left in enumerate(limited):
+            for right in limited[idx + 1:]:
+                ly, lx = left["center"]
+                ry, rx = right["center"]
+                if abs(lx - rx) >= abs(ly - ry):
+                    relation = "left_of" if lx < rx else "right_of"
+                    distance = abs(lx - rx)
+                else:
+                    relation = "above" if ly < ry else "below"
+                    distance = abs(ly - ry)
+                relations.append({
+                    "src_color": int(left["color"]),
+                    "dst_color": int(right["color"]),
+                    "relation": relation,
+                    "distance": float(distance),
+                })
+        return relations[:16]
+
+    def extract_facts(self, agent, frame, *, frame_hash, avail_ids, blocked_click_coord=None):
+        frame = agent._normalized_palette_frame(frame)
+        repeated_state = bool(agent._frame_matches_previous(frame, frame_hash=frame_hash))
+        direction_block = agent._blocked_direction_action_index(frame, frame_hash=frame_hash)
+        cache_key = (
+            int(agent.cl),
+            int(frame_hash),
+            tuple(int(aid) for aid in avail_ids),
+            None if blocked_click_coord is None else (int(blocked_click_coord[0]), int(blocked_click_coord[1])),
+            int(agent.pai) if agent.pai is not None else None,
+            int(direction_block) if direction_block is not None else None,
+            repeated_state,
+        )
+        cached = self._extract_facts_cache.get(cache_key)
+        if cached is not None:
+            return dict(cached)
+        bg = self._background(frame)
+        components = self._component_facts(frame, bg)
+        palette = tuple(sorted({int(v) for v in np.unique(frame) if int(v) != bg}))
+        facts = {
+            "level": int(agent.cl),
+            "frame_hash": int(frame_hash),
+            "background": int(bg),
+            "palette": palette[:8],
+            "component_count": int(len(components)),
+            "components": components,
+            "relations": self._spatial_relations(components),
+            "available_actions": tuple(int(aid) for aid in avail_ids),
+            "recent_action_index": (int(agent.pai) if agent.pai is not None else None),
+            "blocked_click_coord": (tuple(blocked_click_coord) if blocked_click_coord is not None else None),
+            "blocked_direction_index": (int(direction_block) if direction_block is not None else None),
+            "repeated_state": repeated_state,
+        }
+        self._extract_facts_cache[cache_key] = dict(facts)
+        return facts
+
+    def context_key(self, facts):
+        component_colors = tuple(int(comp["color"]) for comp in facts["components"][:6])
+        return (
+            tuple(int(v) for v in facts["palette"]),
+            component_colors,
+            int(facts["component_count"]),
+            tuple(int(v) for v in facts["available_actions"]),
+            bool(facts["repeated_state"]),
+            facts["blocked_click_coord"],
+            facts["blocked_direction_index"],
+        )
+
+    def _candidate_key(self, candidate):
+        coords = candidate.get("coords")
+        if coords is None:
+            return (int(candidate["action_idx"]), None)
+        return (int(candidate["action_idx"]), (int(coords[0]), int(coords[1])))
+
+    def rank_candidates(self, *, agent, facts, candidates):
+        context_key = self.context_key(facts)
+        ranked = []
+        for candidate in candidates:
+            action_key = self._candidate_key(candidate)
+            score = float(candidate.get("symbolic_score", 0.0))
+            score += self.backend.score_action(
+                level_idx=agent.cl,
+                context_key=context_key,
+                action_key=action_key,
+            )
+            if facts["repeated_state"]:
+                score += float(candidate.get("repeat_recovery_bonus", 0.0))
+            if candidate.get("blocked"):
+                score -= 5.0
+            ranked.append((score, candidate))
+        ranked.sort(key=lambda item: (item[0], -int(item[1]["action_idx"])), reverse=True)
+        return ranked
+
+    def record_transition(self, *, agent, prev_frame, curr_frame, prev_hash, curr_hash, action_idx, reward, changed, avail_ids):
+        if action_idx is None:
+            return
+        blocked_click_coord = agent._blocked_click_coord(curr_frame, frame_hash=curr_hash)
+        facts = self.extract_facts(
+            agent,
+            curr_frame,
+            frame_hash=curr_hash,
+            avail_ids=avail_ids,
+            blocked_click_coord=blocked_click_coord,
+        )
+        context_key = self.context_key(facts)
+        if int(action_idx) < 5:
+            action_key = (int(action_idx), None)
+        else:
+            action_key = (int(action_idx), agent._click_coord_from_action_index(int(action_idx)))
+        self.backend.remember_transition(
+            level_idx=agent.cl,
+            prev_hash=prev_hash,
+            curr_hash=curr_hash,
+            context_key=context_key,
+            action_key=action_key,
+            reward=float(reward),
+            changed=bool(changed),
+        )
+        self.backend.upsert_state(agent.cl, curr_hash, facts)
 
 @contextmanager
 def _paused_bfs_gc():
@@ -1573,7 +2076,14 @@ class MyAgent(Agent):
         s._bfs_solution = None
         s._bfs_step = 0
         s._bfs_tried = False
+        s._bfs_cached_validation = {}
         s._semantic_detector = _detect_sprites_helper
+        s._symbolic_enabled_flag = os.environ.get("ARC_SYMBOLIC_ENABLED", "0").strip().lower() not in {"0", "false", "no", "off"}
+        s._symbolic_force_enable = os.environ.get("ARC_SYMBOLIC_FORCE", "0").strip().lower() in {"1", "true", "yes", "on"}
+        s._symbolic_fallback_mode = os.environ.get("ARC_SYMBOLIC_FALLBACK_MODE", "symbolic_then_bfs").strip().lower() or "symbolic_then_bfs"
+        s._symbolic_memory_keep_summary = os.environ.get("ARC_SYMBOLIC_KEEP_SUMMARY", "1").strip().lower() not in {"0", "false", "no", "off"}
+        s._symbolic_verbose = os.environ.get("ARC_SYMBOLIC_VERBOSE", "0").strip().lower() in {"1", "true", "yes", "on"}
+        s._hyperon_core = _HyperonAgentCore()
 
     def append_frame(s, f):
         s.frames.append(f)
@@ -2657,7 +3167,8 @@ class MyAgent(Agent):
 
     def _reset_level_runtime_state(s, lvl):
         """Reset per-level caches and counters while keeping learned network state."""
-        s.net.eval()
+        if s.net is not None:
+            s.net.eval()
         s._clear_recent_action_state()
         s._semantic_target_coord=None
         s.cl=lvl
@@ -2685,6 +3196,309 @@ class MyAgent(Agent):
         if not s._bfs_solution:
             s._eps = 0.15
             s._eps_steps = 0
+        if s._hyperon_core is not None:
+            s._hyperon_core.reset_level(lvl, keep_summary=s._symbolic_memory_keep_summary)
+
+    def _hyperon_enabled(s):
+        if not s._symbolic_enabled_flag or s._hyperon_core is None:
+            return False
+        return bool(s._symbolic_force_enable or s._hyperon_core.backend.instance is not None)
+
+    def _hyperon_uses_bfs_fallback(s):
+        return s._symbolic_fallback_mode in {"symbolic_then_bfs", "symbolic_then_bfs_then_heuristic"}
+
+    def _hyperon_uses_heuristic_fallback(s):
+        return s._symbolic_fallback_mode in {"symbolic_then_heuristic", "symbolic_then_bfs_then_heuristic", "symbolic_then_bfs"}
+
+    def _finalize_hyperon_action(s, aidx, coords, tensor, raw, frame_hash, blocked_click_coord,
+                                 reasoning, target_choice=None):
+        if aidx < 5:
+            sel = s._fresh_action(aidx + 1)
+        else:
+            y, x = coords
+            sel = s._click_action((y, x))
+        s._refresh_semantic_target_coord(
+            raw,
+            fallback_coord=coords if aidx >= 5 else None,
+            blocked_click_coord=blocked_click_coord,
+            frame_hash=frame_hash,
+            target_choice=target_choice,
+        )
+        action_idx = int(aidx) if aidx < 5 else s._click_action_index(coords)
+        return s._finalize_action(
+            sel,
+            reasoning,
+            tensor=tensor,
+            raw=raw,
+            frame_hash=frame_hash,
+            action_idx=action_idx,
+            remember_recent=True,
+        )
+
+    def _update_hyperon_transition(s, raw, frame_hash, avail_ids):
+        if s.pr is None:
+            return
+        prev_h = s.ph if s.ph is not None else s._fast_frame_hash(s.pr)
+        diff_map = (s.pr != raw) & s._reward_mask
+        changed = bool(np.any(diff_map))
+        reward = s._reward(s.pr, raw, prev_h, frame_hash, changed=changed, curr_objs=None, move_bonus=0.0, moved=0)
+        if changed:
+            s._ckpt_hash = frame_hash
+            s._unproductive = 0
+            s._decay_blocked_click_history()
+            s._decay_blocked_direction_history()
+        else:
+            s._unproductive += 1
+            if s.pai is not None and int(s.pai) >= 5:
+                s._remember_blocked_click_coord(s._click_coord_from_action_index(int(s.pai)))
+            elif s.pai is not None and 0 <= int(s.pai) < 4:
+                s._remember_blocked_direction_index(int(s.pai))
+        if s._hyperon_core is not None:
+            s._hyperon_core.record_transition(
+                agent=s,
+                prev_frame=s.pr,
+                curr_frame=raw,
+                prev_hash=prev_h,
+                curr_hash=frame_hash,
+                action_idx=s.pai,
+                reward=reward,
+                changed=changed,
+                avail_ids=avail_ids,
+            )
+
+    def _hyperon_candidates(s, raw, avail, avail_ids, blocked_click_coord, frame_hash):
+        target_choice = s._semantic_target_choice(
+            raw,
+            blocked_click_coord=blocked_click_coord,
+            frame_hash=frame_hash,
+        )
+        direct_click = s._semantic_direct_click_choice(
+            raw,
+            avail,
+            avail_ids=avail_ids,
+            blocked_click_coord=blocked_click_coord,
+            frame_hash=frame_hash,
+            target_choice=target_choice,
+        )
+        direction_choice = s._semantic_direction_action(
+            raw,
+            avail,
+            avail_ids=avail_ids,
+            frame_hash=frame_hash,
+            target_choice=target_choice,
+        )
+        candidates = []
+        seen = set()
+
+        def add_candidate(action_idx, coords, symbolic_score, reasoning, repeat_recovery_bonus=0.0):
+            key = (int(action_idx), None if coords is None else (int(coords[0]), int(coords[1])))
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append({
+                "action_idx": int(action_idx),
+                "coords": coords,
+                "symbolic_score": float(symbolic_score),
+                "reasoning": reasoning,
+                "repeat_recovery_bonus": float(repeat_recovery_bonus),
+                "blocked": bool(coords is not None and s._blocked_click_matches_coord(
+                    raw,
+                    coords,
+                    blocked_click_coord=blocked_click_coord,
+                    frame_hash=frame_hash,
+                )),
+                "target_choice": target_choice,
+            })
+
+        if direct_click is not None:
+            add_candidate(direct_click[0], direct_click[1], 5.0, "symbolic:direct-click", repeat_recovery_bonus=1.0)
+        if direction_choice is not None:
+            add_candidate(direction_choice[0], None, 4.0, "symbolic:semantic-direction", repeat_recovery_bonus=1.25)
+
+        direction_bonuses = s._semantic_direction_bonuses(
+            raw,
+            avail,
+            avail_ids=avail_ids,
+            frame_hash=frame_hash,
+            target_choice=target_choice,
+        ) or {}
+        for aid in avail_ids:
+            if 1 <= int(aid) <= 5:
+                aidx = int(aid) - 1
+                add_candidate(aidx, None, float(direction_bonuses.get(aidx, 0.0)), f"symbolic:a{int(aid)}")
+
+        click_targets = s._semantic_click_targets_compat(
+            raw,
+            limit=8,
+            blocked_click_coord=blocked_click_coord,
+            frame_hash=frame_hash,
+        )
+        fallback_targets = s._heuristic_click_fallback_targets(
+            raw,
+            blocked_click_coord=blocked_click_coord,
+            frame_hash=frame_hash,
+        )
+        click_candidates = list(click_targets)
+        for coord in fallback_targets:
+            if coord not in click_candidates:
+                click_candidates.append(coord)
+        if 6 in avail_ids:
+            for rank, coord in enumerate(click_candidates[:12]):
+                add_candidate(5, (int(coord[0]), int(coord[1])), max(0.0, 3.0 - 0.25 * rank), "symbolic:click-target")
+        return candidates, target_choice
+
+    def _choose_action_via_hyperon(s, frames, lf):
+        lvl = s._lvl(lf)
+        use_bfs_fallback = s._hyperon_uses_bfs_fallback()
+        if lvl != s.cl:
+            if use_bfs_fallback and not s._bfs_tried:
+                s._bfs_tried = True
+                s._init_bfs()
+            s._bfs_solution = None
+            s._bfs_step = 0
+            if s._bfs and use_bfs_fallback:
+                s._try_bfs_solve(lvl, lf=lf)
+            s._reset_level_runtime_state(lvl)
+
+        if lf.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
+            return s._finalize_control_action(
+                GameAction.RESET.value if hasattr(GameAction.RESET, "value") else int(GameAction.RESET),
+                "reset",
+                clear_recent=True,
+            )
+
+        tensor = s._tensor(lf)
+        raw = s._raw(lf)
+        ch = s._fast_frame_hash(raw)
+        avail = getattr(lf, "available_actions", None) or []
+        avail_ids = s._available_action_ids(avail)
+        avail_summary = s._availability_summary(avail_ids)
+        s._undo_avail = avail_summary["has_undo"]
+
+        s._update_hyperon_transition(raw, ch, avail_ids)
+
+        if not avail_summary["has_modeled"]:
+            return s._handle_non_modeled_availability(tensor, raw, ch)
+
+        blocked_click_coord = s._blocked_click_coord(raw, frame_hash=ch)
+        if (s._undo_avail and s._ckpt_hash and
+                s._modeled_frontier_exhausted(
+                    raw,
+                    avail_ids,
+                    blocked_click_coord=blocked_click_coord,
+                    frame_hash=ch,
+                    avail_summary=avail_summary)):
+            return s._finalize_control_action(
+                7,
+                "undo-frontier",
+                tensor=tensor,
+                raw=raw,
+                frame_hash=ch,
+                remember_recent=True,
+            )
+
+        s._ensure_click_template(raw)
+
+        forced_undo = s._maybe_force_undo(tensor, raw, ch)
+        if forced_undo is not None:
+            return forced_undo
+
+        facts = s._hyperon_core.extract_facts(
+            s,
+            raw,
+            frame_hash=ch,
+            avail_ids=avail_ids,
+            blocked_click_coord=blocked_click_coord,
+        )
+        s._hyperon_core.backend.upsert_state(s.cl, ch, facts)
+        candidates, target_choice = s._hyperon_candidates(raw, avail, avail_ids, blocked_click_coord, ch)
+        ranked = s._hyperon_core.rank_candidates(agent=s, facts=facts, candidates=candidates)
+        if ranked:
+            score, best = ranked[0]
+            if s._symbolic_verbose:
+                stats = s._hyperon_core.backend.space_stats()
+                logger.info(
+                    "Hyperon choose L%s backend=%s atoms=%s transitions=%s score=%.3f reasoning=%s",
+                    s.cl,
+                    stats["backend_name"],
+                    stats["atom_count"],
+                    stats["transition_count"],
+                    score,
+                    best["reasoning"],
+                )
+            return s._finalize_hyperon_action(
+                best["action_idx"],
+                best["coords"],
+                tensor,
+                raw,
+                ch,
+                blocked_click_coord,
+                best["reasoning"],
+                target_choice=best.get("target_choice"),
+            )
+
+        if use_bfs_fallback and s._bfs_solution and s._bfs_step < len(s._bfs_solution):
+            act_id, data = s._bfs_solution[s._bfs_step]
+            s._bfs_step += 1
+            sel = s._fresh_action(act_id, data)
+            bfs_click_coord = (int(data.get("y", 0)), int(data.get("x", 0))) if int(act_id) == 6 and data else None
+            s._refresh_semantic_target_coord(raw, fallback_coord=bfs_click_coord)
+            raw_snapshot = s._snapshot_frame(raw)
+            s.fhist.append(raw_snapshot)
+            action_idx = (int(act_id) - 1) if 1 <= int(act_id) <= 5 else (
+                s._click_action_index(bfs_click_coord) if int(act_id) == 6 and data else None
+            )
+            return s._finalize_action(
+                sel,
+                f"bfs:{s._bfs_step}/{len(s._bfs_solution)}",
+                tensor=tensor,
+                raw=raw,
+                frame_hash=ch,
+                action_idx=action_idx,
+                remember_recent=True,
+                raw_snapshot=raw_snapshot,
+            )
+
+        if s._hyperon_uses_heuristic_fallback():
+            heuristic_choice = s._heuristic(
+                raw,
+                avail,
+                s.la,
+                blocked_click_coord=blocked_click_coord,
+                avail_ids=avail_ids,
+                frame_hash=ch,
+                avail_summary=avail_summary,
+            )
+            if heuristic_choice is not None:
+                aidx, coords = heuristic_choice
+                return s._finalize_hyperon_action(
+                    aidx,
+                    coords,
+                    tensor,
+                    raw,
+                    ch,
+                    blocked_click_coord,
+                    "symbolic:heuristic-fallback",
+                    target_choice=None,
+                )
+
+        first_modeled = next((int(aid) for aid in avail_ids if 1 <= int(aid) <= 5), None)
+        if first_modeled is not None:
+            return s._finalize_hyperon_action(
+                first_modeled - 1,
+                None,
+                tensor,
+                raw,
+                ch,
+                blocked_click_coord,
+                "symbolic:first-legal",
+                target_choice=None,
+            )
+        return s._finalize_control_action(
+            GameAction.RESET.value if hasattr(GameAction.RESET, "value") else int(GameAction.RESET),
+            "symbolic:reset-fallback",
+            clear_recent=True,
+        )
 
     def _ensure_click_template(s, raw):
         """Populate the click heatmap lazily for the current level."""
@@ -3268,6 +4082,7 @@ class MyAgent(Agent):
 
     def _init_bfs(s):
         """Initialize BFS solver on first call."""
+        s._bfs_cached_validation.clear()
         src, cls = find_game_source_and_class(s.game_id, s.arc_env)
         if src:
             s._bfs = BFSSolver(src, cls, scan_timeout=2, bfs_timeout=60)
@@ -3279,6 +4094,41 @@ class MyAgent(Agent):
         else:
             logger.warning(f"BFS: game source not found for {s.game_id}")
 
+    def _bfs_solution_signature(s, solution):
+        if not solution:
+            return ()
+        sig = []
+        for act_id, data in solution:
+            if not data:
+                sig.append((int(act_id),))
+                continue
+            sig.append((int(act_id), tuple(sorted((str(k), int(v)) for k, v in data.items()))))
+        return tuple(sig)
+
+    def _validate_bfs_cached_solution(s, level_idx, cached):
+        signature = s._bfs_solution_signature(cached)
+        if not signature:
+            return None
+        cache_key = (int(level_idx), signature)
+        if cache_key in s._bfs_cached_validation:
+            validated = s._bfs_cached_validation[cache_key]
+            return list(validated) if validated else None
+        validated = ()
+        try:
+            g_cache = s._bfs.game_cls()
+            g_cache.set_level(level_idx)
+            g_cache.perform_action(ActionInput(id=GameAction.RESET), raw=True)
+            g_cache.perform_action(ActionInput(id=GameAction.RESET), raw=True)
+            for i, (act_id, data) in enumerate(cached):
+                ai = ActionInput(id=GameAction.from_id(act_id), data=data) if data else ActionInput(id=GameAction.from_id(act_id))
+                r = g_cache.perform_action(ai, raw=True)
+                if r.levels_completed > level_idx or g_cache._current_level_index > level_idx:
+                    validated = tuple(cached[:i+1])
+                    break
+        except Exception:
+            validated = ()
+        s._bfs_cached_validation[cache_key] = validated
+        return list(validated) if validated else None
 
     def _adaptive_bfs_timeout(s, level_idx):
         # Keep BFS useful without letting early hard levels consume the full run.
@@ -3304,22 +4154,12 @@ class MyAgent(Agent):
         # Try cached solution for this level first (avoids re-solving on resets)
         cached = s._bfs.solutions.get(level_idx)
         if cached:
-            try:
-                g_cache = s._bfs.game_cls()
-                g_cache.set_level(level_idx)
-                g_cache.perform_action(ActionInput(id=GameAction.RESET), raw=True)
-                g_cache.perform_action(ActionInput(id=GameAction.RESET), raw=True)
-                for i, (act_id, data) in enumerate(cached):
-                    ai = ActionInput(id=GameAction.from_id(act_id), data=data) if data else ActionInput(id=GameAction.from_id(act_id))
-                    r = g_cache.perform_action(ai, raw=True)
-                    if r.levels_completed > level_idx or g_cache._current_level_index > level_idx:
-                        sol = cached[:i+1]
-                        s._bfs_solution = sol
-                        s._bfs_step = 0
-                        logger.info(f"BFS L{level_idx}: using cached solution ({i+1} actions)")
-                        return sol
-            except Exception:
-                pass
+            sol = s._validate_bfs_cached_solution(level_idx, cached)
+            if sol:
+                s._bfs_solution = sol
+                s._bfs_step = 0
+                logger.info(f"BFS L{level_idx}: using cached solution ({len(sol)} actions)")
+                return sol
         # Compute CNN frame tensor for guided BFS action ordering
         net = s.net if s.net is not None else None
         frame_tensor = None
@@ -5677,6 +6517,8 @@ class MyAgent(Agent):
 
     def choose_action(s, frames, lf):
         try:
+            if s._hyperon_enabled():
+                return s._choose_action_via_hyperon(frames, lf)
             lvl = s._lvl(lf)
 
             # ===== LEVEL CHANGE =====

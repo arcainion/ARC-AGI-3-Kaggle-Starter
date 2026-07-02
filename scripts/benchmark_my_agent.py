@@ -373,6 +373,29 @@ def run_benchmarks(iterations=200, warmup=20):
     policy_blocked_click_coord = policy_agent._blocked_click_coord(frame, frame_hash=policy_frame_hash)
     policy_tensor = policy_agent._encode_frame_tensor(frame)
 
+    warm_bfs_agent = make_agent()
+
+    class _WarmCacheReplayGame:
+        def __init__(self):
+            self._current_level_index = 0
+
+        def set_level(self, level_idx: int):
+            self._current_level_index = int(level_idx)
+
+        def perform_action(self, action_input, raw=True):
+            aid = action_input.id.value if hasattr(action_input.id, "value") else int(action_input.id)
+            if aid == 1:
+                self._current_level_index += 1
+            bench_frame = np.full((64, 64), self._current_level_index, dtype=np.uint8)
+            return types.SimpleNamespace(frame=[bench_frame], levels_completed=self._current_level_index)
+
+    warm_bfs_agent._bfs = types.SimpleNamespace(
+        game_cls=_WarmCacheReplayGame,
+        solutions={0: [(1, None), (2, None)]},
+        solve_level=lambda *args, **kwargs: None,
+    )
+    warm_bfs_agent._try_bfs_solve(0)
+
     results = []
     results.append(benchmark_case(
         "availability_summary",
@@ -1016,6 +1039,38 @@ def run_benchmarks(iterations=200, warmup=20):
     results.append(benchmark_case(
         "make_replay_game_and_frame",
         lambda: agent._make_replay_game_and_frame(0),
+        iterations,
+        warmup,
+    ))
+    results.append(benchmark_case(
+        "bfs_warm_fallthrough",
+        lambda: (
+            setattr(warm_bfs_agent, "_bfs_solution", None),
+            setattr(warm_bfs_agent, "_bfs_step", 0),
+            warm_bfs_agent._try_bfs_solve(0),
+        )[-1],
+        iterations,
+        warmup,
+    ))
+    results.append(benchmark_case(
+        "hyperon_extract_and_rank",
+        lambda: agent._hyperon_core.rank_candidates(
+            agent=agent,
+            facts=agent._hyperon_core.extract_facts(
+                agent,
+                frame,
+                frame_hash=frame_hash,
+                avail_ids=avail_ids,
+                blocked_click_coord=blocked_click_coord,
+            ),
+            candidates=agent._hyperon_candidates(
+                frame,
+                avail,
+                avail_ids,
+                blocked_click_coord,
+                frame_hash,
+            )[0],
+        ),
         iterations,
         warmup,
     ))

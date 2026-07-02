@@ -290,6 +290,213 @@ class MyAgentUnitTests(unittest.TestCase):
             tags=["unit"],
         )
 
+    def test_hyperon_backend_initializes_from_package(self):
+        backend = self.mod._HyperonBackend()
+        self.assertTrue(backend.available)
+        self.assertTrue(backend.backend_name.startswith("hyperon@"))
+        self.assertIsNotNone(backend.instance)
+
+    def test_hyperon_backend_handles_missing_runtime(self):
+        with mock.patch.object(self.mod, "_hyperon", None), \
+             mock.patch.object(self.mod, "_HyperonGroundingSpace", None):
+            backend = self.mod._HyperonBackend()
+        self.assertFalse(backend.available)
+        self.assertEqual(backend.backend_name, "hyperon-unavailable")
+        self.assertIsNone(backend.instance)
+
+    def test_hyperon_backend_upsert_populates_state_store_and_atoms(self):
+        backend = self.mod._HyperonBackend()
+        backend.reset_level(0, keep_summary=True)
+        backend.upsert_state(
+            0,
+            123,
+            {
+                "background": 0,
+                "component_count": 2,
+                "palette": (4, 6),
+                "available_actions": (1, 6),
+                "components": [{"color": 4, "area": 3, "bbox": (1, 1, 2, 2), "center": (1.5, 1.5), "touches_edge": False}],
+                "relations": [{"src_color": 4, "dst_color": 6, "relation": "left_of", "distance": 3.0}],
+                "repeated_state": False,
+                "blocked_click_coord": None,
+                "blocked_direction_index": None,
+            },
+        )
+        self.assertIn(123, backend._states[0])
+        self.assertGreaterEqual(backend.instance.atom_count(), 1)
+
+    def test_hyperon_backend_records_transitions_without_runtime(self):
+        with mock.patch.object(self.mod, "_hyperon", None), \
+             mock.patch.object(self.mod, "_HyperonGroundingSpace", None):
+            backend = self.mod._HyperonBackend()
+        backend.reset_level(0, keep_summary=True)
+        backend.remember_transition(
+            level_idx=0,
+            prev_hash=11,
+            curr_hash=12,
+            context_key=(("palette",),),
+            action_key=(1, None),
+            reward=1.25,
+            changed=True,
+        )
+        self.assertEqual(backend._transition_count, 0)
+        self.assertIn(((0, (("palette",),), (1, None))), backend._context_action_stats)
+
+    def test_hyperon_backend_space_stats_report_backend_and_counts(self):
+        agent = self.make_agent()
+        backend = agent._hyperon_core.backend
+        backend.reset_level(0, keep_summary=True)
+        backend.upsert_state(
+            0,
+            123,
+            {
+                "background": 0,
+                "component_count": 0,
+                "palette": (),
+                "available_actions": (1,),
+                "components": [],
+                "relations": [],
+                "repeated_state": False,
+                "blocked_click_coord": None,
+                "blocked_direction_index": None,
+            },
+        )
+        stats = backend.space_stats()
+        self.assertTrue(stats["backend_name"].startswith("hyperon"))
+        self.assertEqual(stats["level_idx"], 0)
+        self.assertGreaterEqual(stats["atom_count"], 1)
+        self.assertGreaterEqual(stats["state_count"], 1)
+
+    def test_symbolic_choose_action_uses_legacy_path_when_disabled(self):
+        agent = self.make_agent()
+        agent._symbolic_enabled_flag = False
+        frame = _make_frame(0, actions=[_GameAction.ACTION1])
+        with mock.patch.object(agent, "_choose_action_via_hyperon", side_effect=AssertionError("symbolic path should stay disabled")):
+            result = agent.choose_action([], frame)
+        self.assertEqual(result.value, 1)
+
+    def test_hyperon_extract_facts_summarizes_palette_components_and_relations(self):
+        agent = self.make_agent()
+        agent._symbolic_force_enable = True
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        frame[5:8, 5:8] = 4
+        frame[10:14, 20:24] = 6
+        frame_hash = agent._fast_frame_hash(frame)
+
+        facts = agent._hyperon_core.extract_facts(
+            agent,
+            frame,
+            frame_hash=frame_hash,
+            avail_ids=[1, 2, 6],
+            blocked_click_coord=None,
+        )
+
+        self.assertEqual(facts["background"], 0)
+        self.assertEqual(facts["palette"], (4, 6))
+        self.assertEqual(facts["component_count"], 2)
+        self.assertTrue(facts["components"])
+        self.assertTrue(facts["relations"])
+
+    def test_hyperon_extract_facts_reuses_cache_for_same_symbolic_inputs(self):
+        agent = self.make_agent()
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        frame[5:8, 5:8] = 4
+        frame_hash = agent._fast_frame_hash(frame)
+
+        first = agent._hyperon_core.extract_facts(
+            agent,
+            frame,
+            frame_hash=frame_hash,
+            avail_ids=[1, 6],
+            blocked_click_coord=None,
+        )
+        with mock.patch.object(agent._hyperon_core, "_component_facts", side_effect=AssertionError("should use cached facts")):
+            second = agent._hyperon_core.extract_facts(
+                agent,
+                frame.copy(),
+                frame_hash=frame_hash,
+                avail_ids=[1, 6],
+                blocked_click_coord=None,
+            )
+        self.assertEqual(first["palette"], second["palette"])
+        self.assertEqual(first["component_count"], second["component_count"])
+
+    def test_hyperon_ranking_prefers_symbolically_strong_candidate(self):
+        agent = self.make_agent()
+        agent._symbolic_force_enable = True
+        facts = {
+            "palette": (4, 6),
+            "components": [{"color": 4}, {"color": 6}],
+            "component_count": 2,
+            "available_actions": (2, 6),
+            "blocked_click_coord": None,
+            "blocked_direction_index": None,
+            "repeated_state": False,
+        }
+        ranked = agent._hyperon_core.rank_candidates(
+            agent=agent,
+            facts=facts,
+            candidates=[
+                {"action_idx": 1, "coords": None, "symbolic_score": 1.0, "reasoning": "dir", "repeat_recovery_bonus": 0.0, "blocked": False},
+                {"action_idx": 5, "coords": (7, 9), "symbolic_score": 4.0, "reasoning": "click", "repeat_recovery_bonus": 0.0, "blocked": False},
+            ],
+        )
+        self.assertEqual(ranked[0][1]["reasoning"], "click")
+
+    def test_hyperon_repeated_state_prefers_recovery_and_avoids_blocked_click(self):
+        agent = self.make_agent()
+        agent._symbolic_force_enable = True
+        frame = np.zeros((64, 64), dtype=np.uint8)
+        frame_hash = agent._fast_frame_hash(frame)
+        agent.pr = frame.copy()
+        agent.ph = frame_hash
+        agent.pai = 5 + 8 * agent.G + 8
+        agent._remember_blocked_click_coord((8, 8))
+        facts = agent._hyperon_core.extract_facts(
+            agent,
+            frame,
+            frame_hash=frame_hash,
+            avail_ids=[2, 6],
+            blocked_click_coord=(8, 8),
+        )
+        ranked = agent._hyperon_core.rank_candidates(
+            agent=agent,
+            facts=facts,
+            candidates=[
+                {"action_idx": 5, "coords": (8, 8), "symbolic_score": 3.0, "reasoning": "blocked-click", "repeat_recovery_bonus": 0.0, "blocked": True},
+                {"action_idx": 1, "coords": None, "symbolic_score": 0.5, "reasoning": "recover-dir", "repeat_recovery_bonus": 2.0, "blocked": False},
+            ],
+        )
+        self.assertEqual(ranked[0][1]["reasoning"], "recover-dir")
+
+    def test_reset_level_runtime_state_resets_hyperon_level_store(self):
+        agent = self.make_agent()
+        agent._symbolic_force_enable = True
+        agent._hyperon_core.backend._states[0] = {123: {"frame_hash": 123}}
+        agent.net = None
+        agent._reset_level_runtime_state(1)
+        self.assertIn(1, agent._hyperon_core.backend._states)
+        self.assertEqual(agent._hyperon_core.level_idx, 1)
+
+    def test_hyperon_falls_back_to_bfs_solution_when_no_candidate_available(self):
+        agent = self.make_agent()
+        agent._symbolic_force_enable = True
+        agent._bfs_solution = [(1, None)]
+        agent._bfs_step = 0
+        frame = _make_frame(0, actions=[_GameAction.ACTION1, _GameAction.ACTION6])
+        agent.cl = 0
+        with mock.patch.object(agent, "_hyperon_candidates", return_value=([], None)):
+            result = agent._choose_action_via_hyperon([], frame)
+        self.assertEqual(result.value, 1)
+        self.assertTrue(result.reasoning.startswith("bfs:"))
+
+    def test_hyperon_runtime_source_has_no_networkx_or_das_wiring(self):
+        source = Path(self.mod.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("networkx", source)
+        self.assertNotIn("hyperon_das", source)
+        self.assertNotIn("hyperon_das_atomdb", source)
+        self.assertNotIn("ARC_DAS_", source)
+
     def test_tensor_encoding_has_no_history_side_effects(self):
         agent = self.make_agent()
         frame = _make_frame(3)
@@ -391,6 +598,44 @@ class MyAgentUnitTests(unittest.TestCase):
         self.assertEqual(result, [(1, None)])
         self.assertEqual(agent._bfs_solution, [(1, None)])
         self.assertEqual(agent._bfs_step, 0)
+
+    def test_try_bfs_solve_reuses_cached_solution_validation(self):
+        agent = self.make_agent()
+        seen = {"game_inits": 0}
+
+        class CacheReplayGame:
+            def __init__(self):
+                seen["game_inits"] += 1
+                self._current_level_index = 0
+
+            def set_level(self, level_idx):
+                self._current_level_index = level_idx
+
+            def perform_action(self, action_input, raw=True):
+                aid = action_input.id.value if hasattr(action_input.id, "value") else int(action_input.id)
+                if aid == 1:
+                    self._current_level_index += 1
+                frame = np.full((64, 64), self._current_level_index, dtype=np.uint8)
+                return types.SimpleNamespace(frame=[frame], levels_completed=self._current_level_index)
+
+        class FakeBfs:
+            def __init__(self):
+                self.game_cls = CacheReplayGame
+                self.solutions = {0: [(1, None), (2, None)]}
+
+            def solve_level(self, *args, **kwargs):
+                raise AssertionError("cached solution path should not call solve_level")
+
+        agent._bfs = FakeBfs()
+
+        first = agent._try_bfs_solve(0)
+        agent._bfs_solution = None
+        agent._bfs_step = 99
+        second = agent._try_bfs_solve(0)
+
+        self.assertEqual(first, [(1, None)])
+        self.assertEqual(second, [(1, None)])
+        self.assertEqual(seen["game_inits"], 1)
 
     def test_solution_injection_bc_filters_out_click_actions(self):
         agent = self.make_agent()
